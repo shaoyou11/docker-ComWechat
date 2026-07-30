@@ -19,6 +19,27 @@ class FakeProcess:
 
 class DockerWechatHookTests(unittest.TestCase):
     @mock.patch("run.signal.signal")
+    def test_prepare_copies_hook_and_keeps_source(self, _signal):
+        hook = run.DockerWechatHook()
+        with mock.patch("run.os.path.exists", return_value=True):
+            with mock.patch("run.subprocess.run") as command:
+                hook.prepare()
+        self.assertEqual(command.call_args_list[1].args[0][0], "cp")
+        self.assertEqual(command.call_args_list[1].args[0][1], "-p")
+
+    @mock.patch("run.signal.signal")
+    def test_prepare_accepts_existing_target_after_restart(self, _signal):
+        hook = run.DockerWechatHook()
+        exists = {
+            "/WeChatHook.exe": False,
+            "/comwechat/http/WeChatHook.exe": True,
+        }
+        with mock.patch("run.os.path.exists", side_effect=exists.__getitem__):
+            with mock.patch("run.subprocess.run") as command:
+                hook.prepare()
+        self.assertEqual(command.call_count, 1)
+
+    @mock.patch("run.signal.signal")
     def test_bridge_disabled_keeps_original_mode(self, _signal):
         hook = run.DockerWechatHook()
         with mock.patch("run.BridgeConfig.from_env") as from_env:
@@ -59,6 +80,16 @@ class DockerWechatHookTests(unittest.TestCase):
         hook.wechat = FakeProcess(status=7)
         hook.reg_hook = FakeProcess()
         with self.assertRaisesRegex(RuntimeError, "WeChat process stopped"):
+            hook.monitor_children()
+
+    @mock.patch("run.time.sleep", side_effect=RuntimeError("one loop"))
+    @mock.patch("run.signal.signal")
+    def test_monitor_ignores_vnc_daemon_parent_exit(self, _signal, _sleep):
+        hook = run.DockerWechatHook()
+        hook.vnc = FakeProcess(status=0)
+        hook.wechat = FakeProcess()
+        hook.reg_hook = FakeProcess()
+        with self.assertRaisesRegex(RuntimeError, "one loop"):
             hook.monitor_children()
 
 

@@ -8,7 +8,7 @@
 
 ```text
 ghcr.io/shaoyou11/docker-comwechat:latest
-ghcr.io/shaoyou11/docker-comwechat:1.0.0-bridge.1
+ghcr.io/shaoyou11/docker-comwechat:1.0.0-bridge.2
 ```
 
 `latest` 用于跟随本仓库已验证版本；生产部署同时记录不可变镜像摘要和版本标签，

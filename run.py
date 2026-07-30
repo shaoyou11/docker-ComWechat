@@ -29,10 +29,12 @@ class DockerWechatHook:
 
     def prepare(self):
         subprocess.run(["unzip", "-o", "-d", "comwechat", "comwechat.zip"], check=True)
-        subprocess.run(
-            ["mv", "/WeChatHook.exe", "/comwechat/http/WeChatHook.exe"],
-            check=True,
-        )
+        source = "/WeChatHook.exe"
+        target = "/comwechat/http/WeChatHook.exe"
+        if os.path.exists(source):
+            subprocess.run(["cp", "-p", source, target], check=True)
+        elif not os.path.exists(target):
+            raise RuntimeError("WeChatHook.exe 不存在")
 
     def run_vnc(self):
         os.makedirs("/root/.vnc", mode=0o755, exist_ok=True)
@@ -113,7 +115,6 @@ class DockerWechatHook:
             for name, process in (
                 ("WeChat", self.wechat),
                 ("Hook", self.reg_hook),
-                ("VNC", self.vnc),
             ):
                 if process is None:
                     continue
