@@ -14,6 +14,8 @@ from urllib import request
 from urllib.error import URLError, HTTPError
 from typing import Any, Dict, Optional, Tuple
 
+from reliable_queue import ReliableQueueConfig, SQLiteMessageQueue
+
 
 LOGGER = logging.getLogger("comwechat_bridge")
 if not LOGGER.handlers:
@@ -97,6 +99,13 @@ class BridgeConfig:
     hook_retry_times: int
     hook_retry_interval_seconds: float
     metrics_interval_seconds: int
+    db_path: str = ":memory:"
+    lease_seconds: int = 120
+    max_attempts: int = 10
+    message_ttl_seconds: int = 7 * 24 * 60 * 60
+    ack_retention_seconds: int = 7 * 24 * 60 * 60
+    dead_retention_seconds: int = 30 * 24 * 60 * 60
+    retry_delay_seconds: int = 30
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -126,6 +135,28 @@ class BridgeConfig:
             metrics_interval_seconds=max(
                 1, _env_int("COMWECHAT_BRIDGE_METRICS_INTERVAL_SECONDS", 10)
             ),
+            db_path=os.environ.get(
+                "COMWECHAT_BRIDGE_DB_PATH",
+                "/var/lib/comwechat-bridge/queue.db",
+            ),
+            lease_seconds=max(10, _env_int("COMWECHAT_BRIDGE_LEASE_SECONDS", 120)),
+            max_attempts=max(1, _env_int("COMWECHAT_BRIDGE_MAX_ATTEMPTS", 10)),
+            message_ttl_seconds=max(
+                60,
+                _env_int("COMWECHAT_BRIDGE_MESSAGE_TTL_SECONDS", 7 * 24 * 60 * 60),
+            ),
+            ack_retention_seconds=max(
+                60,
+                _env_int("COMWECHAT_BRIDGE_ACK_RETENTION_SECONDS", 7 * 24 * 60 * 60),
+            ),
+            dead_retention_seconds=max(
+                60,
+                _env_int("COMWECHAT_BRIDGE_DEAD_RETENTION_SECONDS", 30 * 24 * 60 * 60),
+            ),
+            retry_delay_seconds=max(
+                0,
+                _env_int("COMWECHAT_BRIDGE_RETRY_DELAY_SECONDS", 30),
+            ),
         )
 
 
@@ -143,7 +174,23 @@ class MessageBuffer:
         self._reorder_heap: list[Tuple[float, int, Dict[str, Any]]] = []
         self._probe_queue: deque[Tuple[float, int, Dict[str, Any]]] = deque()
         self._normal_queue: deque[Dict[str, Any]] = deque()
-        self._ready_queue: deque[Dict[str, Any]] = deque()
+        self.queue = SQLiteMessageQueue(
+            ReliableQueueConfig(
+                db_path=config.db_path,
+                lease_seconds=config.lease_seconds,
+                max_attempts=config.max_attempts,
+                message_ttl_seconds=config.message_ttl_seconds,
+                ack_retention_seconds=config.ack_retention_seconds,
+                dead_retention_seconds=config.dead_retention_seconds,
+                retry_delay_seconds=config.retry_delay_seconds,
+            )
+        )
+        recovered = self.queue.recover_staged()
+        if recovered:
+            LOGGER.warning(
+                "Bridge recovered %s staged messages from persistent queue.",
+                recovered,
+            )
 
         self._stats: Dict[str, int] = {
             "ingress_total": 0,
@@ -166,44 +213,47 @@ class MessageBuffer:
             return self._phase_locked()
 
     def queue_size(self) -> int:
-        with self._lock:
-            return (
-                len(self._reorder_heap)
-                + len(self._probe_queue)
-                + len(self._normal_queue)
-                + len(self._ready_queue)
-            )
+        return self.queue.snapshot()["queue_size"]
 
     def ingest(self, msg: Dict[str, Any]) -> None:
         received_ts = time.time()
         ingress_ts = time.monotonic()
+        sort_ts = extract_sort_ts(msg, received_ts)
+        message_id, _, inserted = self.queue.stage(msg, sort_at=sort_ts)
         with self._cond:
             self._stats["ingress_total"] += 1
+            if not inserted:
+                return
+            queued_msg = dict(msg)
+            queued_msg["_bridge_queue_id"] = message_id
             self._flush_probe_if_expired_locked(ingress_ts)
             if is_fast_path(msg):
-                self._ready_queue.appendleft(msg)
+                self._release_locked(queued_msg)
                 self._stats["fast_path_total"] += 1
                 self._stats["ready_total"] += 1
             elif is_login_reorder_anchor(msg):
                 self._close_reorder_window_locked("reset")
                 self._move_probe_into_reorder_locked()
-                self._ready_queue.append(msg)
+                self._release_locked(queued_msg)
                 self._stats["login_anchor_total"] += 1
                 self._stats["ready_total"] += 1
                 self._open_reorder_window_locked(ingress_ts)
             elif self._reorder_active:
-                sort_ts = extract_sort_ts(msg, received_ts)
-                heapq.heappush(self._reorder_heap, (sort_ts, self._seq, msg))
+                heapq.heappush(self._reorder_heap, (sort_ts, self._seq, queued_msg))
                 self._seq += 1
             elif self._probe_started_at is not None:
-                sort_ts = extract_sort_ts(msg, received_ts)
-                self._probe_queue.append((sort_ts, self._seq, msg))
+                self._probe_queue.append((sort_ts, self._seq, queued_msg))
                 self._seq += 1
             else:
-                self._normal_queue.append(msg)
+                self._normal_queue.append(queued_msg)
 
             self._drop_if_overflow_locked()
             self._cond.notify_all()
+
+    def _release_locked(self, msg: Dict[str, Any]) -> None:
+        message_id = msg.get("_bridge_queue_id")
+        if message_id:
+            self.queue.release([str(message_id)])
 
     def _open_reorder_window_locked(self, started_at: float) -> None:
         self._reorder_started_at = started_at
@@ -270,7 +320,6 @@ class MessageBuffer:
             len(self._reorder_heap)
             + len(self._probe_queue)
             + len(self._normal_queue)
-            + len(self._ready_queue)
         ) > self.config.max_buffer:
             dropped = None
             if self._normal_queue:
@@ -279,10 +328,9 @@ class MessageBuffer:
                 _, _, dropped = self._probe_queue.popleft()
             elif self._reorder_heap:
                 _, _, dropped = heapq.heappop(self._reorder_heap)
-            elif self._ready_queue:
-                dropped = self._ready_queue.popleft()
             if dropped is None:
                 break
+            self._release_locked(dropped)
             self._stats["overflow_drop_total"] += 1
 
     def maybe_flush_reorder(self) -> None:
@@ -301,44 +349,44 @@ class MessageBuffer:
         moved = 0
         with self._cond:
             while self._normal_queue and moved < limit:
-                self._ready_queue.append(self._normal_queue.popleft())
+                self._release_locked(self._normal_queue.popleft())
                 moved += 1
                 self._stats["ready_total"] += 1
             if moved:
                 self._cond.notify_all()
         return moved
 
-    def pull(self, max_items: int, wait_ms: int) -> Dict[str, Any]:
-        timeout = max(0, wait_ms) / 1000.0
-        deadline = time.monotonic() + timeout
-        with self._cond:
-            while not self._ready_queue and timeout > 0:
-                self._cond.wait(timeout=timeout)
-                timeout = deadline - time.monotonic()
+    def pull(
+        self,
+        max_items: int,
+        wait_ms: int,
+        ack_mode: bool = False,
+        consumer_id: str = "legacy",
+    ) -> Dict[str, Any]:
+        result = self.queue.pull(
+            max_items=max_items,
+            wait_ms=wait_ms,
+            ack_mode=ack_mode,
+            consumer_id=consumer_id,
+        )
+        with self._lock:
+            self._stats["pulled_total"] += len(result["messages"])
+            result["phase"] = self._phase_locked()
+        return result
 
-            items = []
-            for _ in range(max(1, max_items)):
-                if not self._ready_queue:
-                    break
-                items.append(self._ready_queue.popleft())
-            self._stats["pulled_total"] += len(items)
-            return {
-                "messages": items,
-                "queue_size": len(self._reorder_heap)
-                + len(self._probe_queue)
-                + len(self._normal_queue)
-                + len(self._ready_queue),
-                "phase": self._phase_locked(),
-            }
+    def ack(self, delivery_ids, consumer_id: str) -> int:
+        return self.queue.ack(delivery_ids, consumer_id)
+
+    def nack(self, delivery_ids, consumer_id: str, reason: str) -> int:
+        return self.queue.nack(delivery_ids, consumer_id, reason)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
-            return {
+            snapshot = {
                 "phase": self._phase_locked(),
                 "probe_queue_size": len(self._probe_queue),
                 "reorder_queue_size": len(self._reorder_heap),
                 "normal_queue_size": len(self._normal_queue),
-                "ready_queue_size": len(self._ready_queue),
                 "ingress_total": self._stats["ingress_total"],
                 "ready_total": self._stats["ready_total"],
                 "pulled_total": self._stats["pulled_total"],
@@ -348,6 +396,13 @@ class MessageBuffer:
                 "reordered_total": self._stats["reordered_total"],
                 "overflow_drop_total": self._stats["overflow_drop_total"],
             }
+        durable = self.queue.snapshot()
+        snapshot.update(durable)
+        snapshot["ready_queue_size"] = durable["pending_size"]
+        return snapshot
+
+    def close(self) -> None:
+        self.queue.close()
 
 
 class _ThreadingIngressServer(socketserver.ThreadingTCPServer):
@@ -439,21 +494,22 @@ class BridgeApiServer:
                 if inner_self.path != "/healthz":
                     inner_self._send_json(404, {"ok": False, "error": "not_found"})
                     return
-                queue_size = api_server.buffer.queue_size()
+                snapshot = api_server.buffer.snapshot()
                 inner_self._send_json(
                     200,
                     {
                         "ok": True,
                         "hooks_ready": bool(api_server.state.get("hooks_ready", False)),
-                        "queue_size": queue_size,
+                        "queue_size": snapshot["queue_size"],
+                        "pending_size": snapshot["pending_size"],
+                        "inflight_size": snapshot["inflight_size"],
+                        "dead_letter_size": snapshot["dead_letter_size"],
+                        "acked_total": snapshot["acked_total"],
+                        "deduplicated_total": snapshot["deduplicated_total"],
                     },
                 )
 
             def do_POST(inner_self):
-                if inner_self.path != "/v1/messages/pull":
-                    inner_self._send_json(404, {"ok": False, "error": "not_found"})
-                    return
-
                 try:
                     content_len = int(inner_self.headers.get("Content-Length", "0"))
                 except ValueError:
@@ -466,14 +522,46 @@ class BridgeApiServer:
                     inner_self._send_json(400, {"ok": False, "error": "invalid_json"})
                     return
 
-                try:
-                    max_items = int(payload.get("max_items", 50))
-                    wait_ms = int(payload.get("wait_ms", 15000))
-                except (TypeError, ValueError):
-                    inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                if inner_self.path == "/v1/messages/pull":
+                    try:
+                        max_items = int(payload.get("max_items", 50))
+                        wait_ms = int(payload.get("wait_ms", 15000))
+                    except (TypeError, ValueError):
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    result = api_server.buffer.pull(
+                        max_items=max_items,
+                        wait_ms=wait_ms,
+                        ack_mode=bool(payload.get("ack_mode", False)),
+                        consumer_id=str(payload.get("consumer_id") or "legacy")[:128],
+                    )
+                    inner_self._send_json(200, result)
                     return
-                result = api_server.buffer.pull(max_items=max_items, wait_ms=wait_ms)
-                inner_self._send_json(200, result)
+
+                if inner_self.path in ("/v1/messages/ack", "/v1/messages/nack"):
+                    delivery_ids = payload.get("delivery_ids")
+                    if not isinstance(delivery_ids, list) or not all(
+                        isinstance(item, str) and item for item in delivery_ids
+                    ):
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    consumer_id = str(payload.get("consumer_id") or "")[:128]
+                    if not consumer_id:
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    if inner_self.path.endswith("/ack"):
+                        count = api_server.buffer.ack(delivery_ids, consumer_id)
+                        inner_self._send_json(200, {"ok": True, "acked": count})
+                    else:
+                        count = api_server.buffer.nack(
+                            delivery_ids,
+                            consumer_id,
+                            str(payload.get("reason") or ""),
+                        )
+                        inner_self._send_json(200, {"ok": True, "nacked": count})
+                    return
+
+                inner_self._send_json(404, {"ok": False, "error": "not_found"})
 
             def log_message(inner_self, format: str, *args: Any) -> None:
                 LOGGER.debug("BridgeApiServer: " + format, *args)
@@ -637,4 +725,5 @@ class BridgeService:
         self.ingress.stop()
         for thread in self.threads:
             thread.join(timeout=1.5)
+        self.buffer.close()
         LOGGER.info("Bridge service stopped.")

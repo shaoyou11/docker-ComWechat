@@ -8,7 +8,7 @@
 
 ```text
 ghcr.io/shaoyou11/docker-comwechat:latest
-ghcr.io/shaoyou11/docker-comwechat:1.0.0-bridge.2
+ghcr.io/shaoyou11/docker-comwechat:1.1.0-bridge.1
 ```
 
 `latest` 用于跟随本仓库已验证版本；生产部署同时记录不可变镜像摘要和版本标签，
@@ -24,15 +24,27 @@ environment:
   COMWECHAT_BRIDGE_ENABLED: "true"
   COMWECHAT_BRIDGE_IN_PORT: "23456"
   COMWECHAT_BRIDGE_API_PORT: "19088"
+  COMWECHAT_BRIDGE_DB_PATH: "/var/lib/comwechat-bridge/queue.db"
+  COMWECHAT_BRIDGE_LEASE_SECONDS: "120"
+  COMWECHAT_BRIDGE_MAX_ATTEMPTS: "10"
+  COMWECHAT_BRIDGE_MESSAGE_TTL_SECONDS: "604800"
   COMWECHAT_BRIDGE_MAX_BUFFER: "20000"
   COMWECHAT_CONSUME_RATE_PER_SEC: "5"
+volumes:
+  - "./volume/Bridge:/var/lib/comwechat-bridge"
 ```
 
 启用后提供：
 
 - `GET /healthz`
 - `POST /v1/messages/pull`
-- 消息缓冲、登录阶段排序、速率控制和队列指标
+- `POST /v1/messages/ack`
+- `POST /v1/messages/nack`
+- SQLite WAL 持久化、租约、去重、过期死信、登录阶段排序和队列指标
+
+新消费端在拉取请求中发送 `ack_mode: true`。消息在 ACK 前保持为租约状态；
+消费失败可 NACK 并延迟重试。旧消费端不发送 `ack_mode` 时仍保持拉取即确认的
+兼容行为。
 
 Bridge 只负责消息 Hook 与拉取接口，不点击微信界面，也不自动重启微信。
 登录恢复仍由现有独立 Watchdog 控制，避免两套逻辑相互冲突。
@@ -40,12 +52,14 @@ Bridge 只负责消息 Hook 与拉取接口，不点击微信界面，也不自�
 ## 私有运行文件
 
 `comwechat.zip`、VNC 密码、微信登录数据、EFB 配置和 Telegram 凭据不进入本仓库
-或镜像。生产环境继续通过 Compose 挂载这些私有文件和持久化目录。
+或镜像。生产环境继续通过 Compose 挂载这些私有文件和持久化目录。Bridge 数据库
+必须挂载 `/var/lib/comwechat-bridge`；数据库只保存消息 JSON、附件路径和投递状态，
+不复制附件文件本体。
 
 ## 验证
 
 ```bash
-python3 -m py_compile run.py comwechat_bridge.py healthcheck.py
+python3 -m py_compile run.py comwechat_bridge.py reliable_queue.py healthcheck.py
 python3 -m unittest discover -s tests -v
 ```
 

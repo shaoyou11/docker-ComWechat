@@ -62,7 +62,10 @@ class MessageBufferTests(unittest.TestCase):
         buffer = MessageBuffer(config(max_buffer=100))
         for index in range(120):
             buffer.ingest({"id": index})
-        self.assertEqual(buffer.queue_size(), 100)
+        buffer.emit_ready(limit=200)
+        result = buffer.pull(max_items=200, wait_ms=0)
+        self.assertEqual(len(result["messages"]), 120)
+        self.assertEqual(buffer.queue_size(), 0)
         self.assertEqual(buffer.snapshot()["overflow_drop_total"], 20)
 
 
@@ -107,6 +110,64 @@ class BridgeApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["messages"], [message])
+
+    def test_reliable_pull_requires_ack_before_removal(self):
+        message = {"id": "leased", "isSendMsg": 1, "isSendByPhone": 0}
+        self.buffer.ingest(message)
+        status, payload = self.request_json(
+            "/v1/messages/pull",
+            {
+                "max_items": 10,
+                "wait_ms": 0,
+                "ack_mode": True,
+                "consumer_id": "efb",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["messages"], [message])
+        self.assertEqual(len(payload["deliveries"]), 1)
+        delivery_id = payload["deliveries"][0]["delivery_id"]
+
+        status, ack = self.request_json(
+            "/v1/messages/ack",
+            {"delivery_ids": [delivery_id], "consumer_id": "efb"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(ack["acked"], 1)
+        self.assertEqual(self.buffer.queue_size(), 0)
+
+    def test_reliable_nack_releases_delivery(self):
+        message = {"id": "nack", "isSendMsg": 1, "isSendByPhone": 0}
+        self.buffer.ingest(message)
+        _, payload = self.request_json(
+            "/v1/messages/pull",
+            {
+                "max_items": 10,
+                "wait_ms": 0,
+                "ack_mode": True,
+                "consumer_id": "efb",
+            },
+        )
+        delivery_id = payload["deliveries"][0]["delivery_id"]
+
+        status, nack = self.request_json(
+            "/v1/messages/nack",
+            {
+                "delivery_ids": [delivery_id],
+                "consumer_id": "efb",
+                "reason": "dispatch failed",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(nack["nacked"], 1)
+
+    def test_health_endpoint_includes_durable_queue_counts(self):
+        self.buffer.ingest({"id": "health"})
+        status, payload = self.request_json("/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["queue_size"], 1)
+        self.assertEqual(payload["dead_letter_size"], 0)
+        self.assertIn("deduplicated_total", payload)
 
 
 if __name__ == "__main__":

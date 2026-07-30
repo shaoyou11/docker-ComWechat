@@ -10,12 +10,20 @@ ENV COMWECHAT_VERSION=3.9.12.16 \
     COMWECHAT_BRIDGE_API_HOST=0.0.0.0 \
     COMWECHAT_BRIDGE_API_PORT=19088 \
     COMWECHAT_API_PORT=18888 \
+    COMWECHAT_BRIDGE_DB_PATH=/var/lib/comwechat-bridge/queue.db \
+    COMWECHAT_BRIDGE_LEASE_SECONDS=120 \
+    COMWECHAT_BRIDGE_MAX_ATTEMPTS=10 \
+    COMWECHAT_BRIDGE_MESSAGE_TTL_SECONDS=604800 \
+    COMWECHAT_BRIDGE_ACK_RETENTION_SECONDS=604800 \
+    COMWECHAT_BRIDGE_DEAD_RETENTION_SECONDS=2592000 \
+    COMWECHAT_BRIDGE_RETRY_DELAY_SECONDS=30 \
     COMWECHAT_BRIDGE_MAX_BUFFER=20000 \
     COMWECHAT_CONSUME_RATE_PER_SEC=5
 
-COPY run.py comwechat_bridge.py healthcheck.py /
+COPY run.py comwechat_bridge.py reliable_queue.py healthcheck.py /
 
-RUN python3 -m py_compile /run.py /comwechat_bridge.py /healthcheck.py && \
+RUN mkdir -p /var/lib/comwechat-bridge && \
+    python3 -m py_compile /run.py /comwechat_bridge.py /reliable_queue.py /healthcheck.py && \
     chmod 0755 /run.py /healthcheck.py
 
 EXPOSE 5905 19088

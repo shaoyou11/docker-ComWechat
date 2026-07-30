@@ -3,15 +3,17 @@ services:
     wechatpchook:
         container_name: comwechat
         environment:
-            - VNCPASS=asdfgh123
+            - VNCPASS=${COMWECHAT_VNC_PASSWORD}
             - COMWECHAT=https://github.com/ljc545w/ComWeChatRobot/releases/download/3.7.0.30-0.0.5/3.7.0.30-0.0.5.zip
+            - COMWECHAT_BRIDGE_ENABLED=true
         ipc: host
         volumes:
             - "./volume/WeChat Files/:/home/user/.wine/drive_c/users/user/My Documents/WeChat Files/"
             - "./volume/Application Data/:/home/user/.wine/drive_c/users/user/Application Data/"
+            - "./volume/Bridge/:/var/lib/comwechat-bridge/"
         privileged: true
         network_mode: host
-        image: tomsnow1999/docker-com_wechat_robot:latest
+        image: ghcr.io/shaoyou11/docker-comwechat:latest
         # build: 
         #     context: .
         #     dockerfile: ./Dockerfile
