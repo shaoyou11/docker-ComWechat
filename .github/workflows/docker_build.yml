@@ -1,76 +1,67 @@
-name: CI to Docker Hub
+name: Test and publish GHCR image
 
 on:
   push:
     branches:
       - main
     paths:
-      - .github/workflows/docker_build.yml
-      - 'ComWeChatRobot/**'
-      - 'wine/**'
-      - 'Dockerfile'
-      - 'VERSION'
-      - 'run.py'
-      - 'WeChatHook.exe'
+      - ".github/workflows/docker_build.yml"
+      - "Dockerfile"
+      - "VERSION"
+      - "run.py"
+      - "comwechat_bridge.py"
+      - "healthcheck.py"
+      - "tests/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-comwechat-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
-        # with:
-        #   lfs: true
-      
-      # - name: Checkout LFS objects
-      #   run: git lfs checkout
-
-      # - name: init submodule
-      #   run: git submodule update --init --recursive
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
-
-      - name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@v1
-
-      - name: Cache Docker layers
-        uses: actions/cache@v2
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
+          python-version: "3.9"
+      - name: Compile and test
+        run: |
+          python -m py_compile run.py comwechat_bridge.py healthcheck.py
+          python -m unittest discover -s tests -v
 
-      - uses: docker/login-action@v1
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
-
-      - name: Get Version Tag
-        id: get_version_tag
-        run: echo ::set-output name=VERSION::`cat VERSION`
-
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Read version
+        id: version
+        run: echo "value=$(cat VERSION)" >> "$GITHUB_OUTPUT"
       - name: Build and push
-        id: docker_build
-        uses: docker/build-push-action@v2
+        uses: docker/build-push-action@v6
         with:
-          context: ./
-          file: ./Dockerfile
-          platforms: linux/arm64,linux/amd64
-          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
           push: true
           tags: |
-            ${{ secrets.DOCKER_HUB_USERNAME }}/docker-com_wechat_robot:latest
-            ${{ secrets.DOCKER_HUB_USERNAME }}/docker-com_wechat_robot:${{ steps.get_version_tag.outputs.VERSION }}
+            ghcr.io/shaoyou11/docker-comwechat:latest
+            ghcr.io/shaoyou11/docker-comwechat:${{ steps.version.outputs.value }}
+            ghcr.io/shaoyou11/docker-comwechat:sha-${{ github.sha }}
           labels: |
-            maintainer=${{ github.event.head_commit.author.email }}
-            timestamp=${{ github.event.head_commit.timestamp }}
-            message=${{ github.event.head_commit.message }}
-            commit=${{ github.event.head_commit.url }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache
-
-      - name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,21 +1,22 @@
-name: Update Docker Hub Description
+name: Documentation check
+
 on:
-  push:
-    branches:
-      - main
+  pull_request:
     paths:
-      - README.md
-      - .github/workflows/docker_doc.yml
+      - "README.md"
+      - ".github/workflows/docker_doc.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
-  dockerHubDescription:
+  check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-
-      - name: Docker Hub Description
-        uses: peter-evans/dockerhub-description@v2
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_PASSWORD }}
-          short-description: ${{ github.event.repository.description }}
-          repository: ${{ secrets.DOCKER_HUB_USERNAME }}/docker-com_wechat_robot
+      - uses: actions/checkout@v4
+      - name: Verify required documentation
+        run: |
+          test -s README.md
+          grep -q "COMWECHAT_BRIDGE_ENABLED" README.md
+          grep -q "回滚" README.md

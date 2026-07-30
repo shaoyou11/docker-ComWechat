@@ -1,46 +1,72 @@
-# docker-ComWechat
-[![docker 镜像](https://dockeri.co/image/tomsnow1999/docker-com_wechat_robot)](https://hub.docker.com/r/tomsnow1999/docker-com_wechat_robot/tags)
+# shaoyou11/docker-ComWechat
 
-[![镜像大小](https://badgen.net/docker/size/tomsnow1999/docker-com_wechat_robot)](https://hub.docker.com/r/tomsnow1999/docker-com_wechat_robot/tags)
+为现有 EFB + ComWechat 部署维护的兼容镜像。镜像以当前生产环境使用的
+`tomsnow1999/docker-com_wechat_robot` 固定摘要为底座，保留原有 Wine、
+微信 3.9.12.16、VNC、Hook、版本修正和子进程监控，并加入可选的 Bridge API。
 
-A docker image for [ComWeChatRobot](https://github.com/ljc545w/ComWeChatRobot)
+## 镜像
 
-
-``` shell
-docker run \
-    --name comwechat  \
-    --network host \
-    -e VNCPASS=asdfgh123 \
-    -e COMWECHAT=https://github.com/ljc545w/ComWeChatRobot/releases/download/3.7.0.30-0.0.5/3.7.0.30-0.0.5.zip \
-    -dti  \
-    --ipc=host \
-    --privileged \
-    -v $(pwd)/volume/WeChat\ Files/:'/home/user/.wine/drive_c/users/user/My Documents/WeChat Files/'  \
-    -v $(pwd)/volume/Application\ Data:'/home/user/.wine/drive_c/users/user/Application Data/' \
-    tomsnow1999/docker-com_wechat_robot
+```text
+ghcr.io/shaoyou11/docker-comwechat:latest
+ghcr.io/shaoyou11/docker-comwechat:1.0.0-bridge.1
 ```
 
-### 参数说明
-* 端口 5905: VNC 服务的端口(无法/无需修改)
-* network host: 使用宿主机网络(在 Linux Docker 环境下使用)
-* 环境变量 VNCPASS: 连接 VNC 的密码（可自定义，建议在服务器上使用本镜像的话设置得难一点）
-* 环境变量 COMWECHAT: [ComWeChatRobot](https://github.com/ljc545w/ComWeChatRobot/releases)具体版本的动态库文件压缩包(右键复制发布的文件的下载链接)【不设置此参数则默认为`3.7.0.30-0.0.5`的链接】
-* 目录映射 `WeChat Files`: 微信收到的图片/文件存储的目录(可以取消目录映射)
-* 目录映射 `Application Data`: 微信数据目录(可以取消目录映射)
+`latest` 用于跟随本仓库已验证版本；生产部署同时记录不可变镜像摘要和版本标签，
+便于失败时回滚。当前只构建 `linux/amd64`。
 
-## 如何使用
-1. 运行上方命令启动镜像(更推荐使用 [docker-compose](./docker-compose.yaml) )
-2. 连接上 VNC 扫码登陆微信(建议扫码登陆后把微信的版本号弹窗等关闭)
-3. 使用 python 与微信通信(示例文件 [test.py](./test.py) )
+## Bridge API
 
+Bridge 默认关闭，关闭时行为与现有 TCP 消息接收方式一致。
 
-## 鸣谢
-[ljc545w/ComWeChatRobot](https://github.com/ljc545w/ComWeChatRobot): ComWeChatRobot 项目本体
+```yaml
+environment:
+  COMWECHAT_VERSION: "3.9.12.16"
+  COMWECHAT_BRIDGE_ENABLED: "true"
+  COMWECHAT_BRIDGE_IN_PORT: "23456"
+  COMWECHAT_BRIDGE_API_PORT: "19088"
+  COMWECHAT_BRIDGE_MAX_BUFFER: "20000"
+  COMWECHAT_CONSUME_RATE_PER_SEC: "5"
+```
 
-[0honus0/ComWeChat_Inject](https://github.com/0honus0/ComWeChat_Inject): 本镜像所使用的注入器
+启用后提供：
 
-## 相关项目
-[efb-wechat-comwechat-slave](https://github.com/0honus0/efb-wechat-comwechat-slave): 使用 Telegram 来接收&管理微信消息
+- `GET /healthz`
+- `POST /v1/messages/pull`
+- 消息缓冲、登录阶段排序、速率控制和队列指标
 
-## 声明
-**本项目仅供学习研究，强烈反对商业用途或者滥用(通过程序化控制微信对其他人进行骚扰诈骗等)！使用本项目造成的一切责任与本人无关，一切责任由使用者自行承担！**
+Bridge 只负责消息 Hook 与拉取接口，不点击微信界面，也不自动重启微信。
+登录恢复仍由现有独立 Watchdog 控制，避免两套逻辑相互冲突。
+
+## 私有运行文件
+
+`comwechat.zip`、VNC 密码、微信登录数据、EFB 配置和 Telegram 凭据不进入本仓库
+或镜像。生产环境继续通过 Compose 挂载这些私有文件和持久化目录。
+
+## 验证
+
+```bash
+python3 -m py_compile run.py comwechat_bridge.py healthcheck.py
+python3 -m unittest discover -s tests -v
+```
+
+GitHub Actions 在测试通过后发布 GHCR 镜像。容器健康检查会根据
+`COMWECHAT_BRIDGE_ENABLED` 自动检查 Bridge API 或原有 ComWechat API。
+
+## 上线顺序
+
+1. 备份 Compose、启动脚本、配置、会话目录和当前镜像。
+2. 先以 `COMWECHAT_BRIDGE_ENABLED=false` 替换镜像，确认旧 TCP 模式正常。
+3. EFB 更新到 Bridge 消费端后，再同时启用 Bridge。
+4. 验证容器健康、`/healthz`、EFB 日志和真实微信消息。
+
+## 回滚
+
+生产部署保留原镜像摘要、本地回滚标签、原 Compose 和完整镜像归档。发生异常时：
+
+1. 恢复备份 Compose。
+2. 指向原镜像摘要或本地回滚标签。
+3. 关闭 Bridge 环境变量。
+4. 按 Comwechat、EFB、Watchdog 的既有顺序启动并核验。
+
+本仓库基于 `tom-snow/docker-ComWechat` 的历史代码，并参考
+`jiz4oh/docker-ComWechat` 的 Bridge 实现。

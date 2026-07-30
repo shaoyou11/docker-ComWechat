@@ -1,0 +1,9 @@
+.git
+.github
+*.bak-*
+__pycache__
+tests
+wine
+WeChatHook.exe
+docker-compose*.yaml
+test.py

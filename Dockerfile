@@ -1,44 +1,27 @@
-FROM zixia/wine:6.0
+FROM tomsnow1999/docker-com_wechat_robot@sha256:14a96f3b0037976c7402f29e00698184ca103e7c88b13bead9fb5064e31e5e69
 
 USER root
 WORKDIR /
 
-ENV WINEPREFIX=/home/user/.wine \
-    LANG=zh_CN.UTF-8 \
-    LC_ALL=zh_CN.UTF-8 \
-    DISPLAY=:5 \
-    VNCPASS=YourSafeVNCPassword \
-    COMWECHAT=https://github.com/ljc545w/ComWeChatRobot/releases/download/3.7.0.30-0.1.1-pre/3.7.0.30-0.1.1-pre.zip
+ENV COMWECHAT_VERSION=3.9.12.16 \
+    COMWECHAT_BRIDGE_ENABLED=false \
+    COMWECHAT_BRIDGE_IN_HOST=0.0.0.0 \
+    COMWECHAT_BRIDGE_IN_PORT=23456 \
+    COMWECHAT_BRIDGE_API_HOST=0.0.0.0 \
+    COMWECHAT_BRIDGE_API_PORT=19088 \
+    COMWECHAT_API_PORT=18888 \
+    COMWECHAT_BRIDGE_MAX_BUFFER=20000 \
+    COMWECHAT_CONSUME_RATE_PER_SEC=5
 
-# 提示 vnc 使用的端口， dll 的端口自行映射
-EXPOSE 5905
+COPY run.py comwechat_bridge.py healthcheck.py /
 
+RUN python3 -m py_compile /run.py /comwechat_bridge.py /healthcheck.py && \
+    chmod 0755 /run.py /healthcheck.py
 
-RUN apt update && \
-    apt --no-install-recommends install wget winbind tigervnc-standalone-server tigervnc-common openbox \
-    mesa-utils \
-    procps \
-    pev \
-    pulseaudio-utils -y
+EXPOSE 5905 19088
 
-ADD wine/simsun.ttc /home/user/.wine/drive_c/windows/Fonts/simsun.ttc
-ADD wine/微信.lnk /home/user/.wine/drive_c/users/Public/Desktop/微信.lnk
-ADD wine/system.reg wine/user.reg wine/userdef.reg /home/user/.wine/
-ADD WeChatHook.exe run.py /
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD ["python3", "/healthcheck.py"]
 
-# COPY wine/Tencent.zip /Tencent.zip
-RUN wget --no-check-certificate -O /Tencent.zip "https://github.com/tom-snow/docker-ComWechat/releases/download/v0.2_wc3.7.0.30/Tencent.zip" && \
-    wget --no-check-certificate -O /bin/dumb-init "https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_x86_64" && \
-    mkdir -p "/home/user/WeChat Files" "/home/user/.wine/drive_c/users/user/Application Data" && \
-    chmod a+x /bin/dumb-init && \
-    chmod a+x /run.py && \
-    rm -rf "/home/user/.wine/drive_c/Program Files/Tencent/" && \
-    unzip Tencent.zip && \
-    mv wine/Tencent "/home/user/.wine/drive_c/Program Files/" && \
-    chown root:root -R /home/user/.wine && \
-    apt autoremove -y && \
-    apt clean && \
-    rm -rf wine Tencent.zip /tmp/*
-
-ENTRYPOINT [ "/bin/dumb-init" ]
+ENTRYPOINT ["/bin/dumb-init", "--"]
 CMD ["/run.py", "start"]
