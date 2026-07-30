@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -158,6 +160,57 @@ class ReliableQueueTests(unittest.TestCase):
         self.assertEqual(first["deliveries"], [])
         self.assertEqual(second["messages"], [])
         self.assertEqual(queue.snapshot()["acked_size"], 1)
+        queue.close()
+
+    def test_release_order_wins_over_untrusted_message_timestamp(self):
+        queue = self.queue()
+        future_id, _, _ = queue.stage(self.message("future"), sort_at=9_999_999)
+        fast_id, _, _ = queue.stage(self.message("fast"), sort_at=1)
+
+        queue.release([future_id])
+        queue.release([fast_id])
+        result = queue.pull(2, 0, True, "efb")
+
+        self.assertEqual(
+            [message["msgid"] for message in result["messages"]],
+            ["future", "fast"],
+        )
+        queue.close()
+
+    def test_long_poll_wakes_when_nack_delay_expires(self):
+        queue = SQLiteMessageQueue(
+            ReliableQueueConfig(
+                db_path=str(self.path),
+                lease_seconds=10,
+                max_attempts=3,
+                message_ttl_seconds=100,
+                ack_retention_seconds=100,
+                dead_retention_seconds=1_000,
+                retry_delay_seconds=0.1,
+            )
+        )
+        queue.stage(self.message())
+        queue.release_all_staged()
+        first = queue.pull(1, 0, True, "efb")
+        queue.nack(
+            [first["deliveries"][0]["delivery_id"]],
+            "efb",
+            "retry",
+        )
+
+        result = {}
+
+        def consume():
+            result.update(queue.pull(1, 1_000, True, "efb"))
+
+        started = time.monotonic()
+        thread = threading.Thread(target=consume)
+        thread.start()
+        thread.join(timeout=0.5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["messages"], [self.message()])
+        self.assertLess(time.monotonic() - started, 0.5)
         queue.close()
 
     def test_fallback_dedup_key_is_stable_for_json_key_order(self):

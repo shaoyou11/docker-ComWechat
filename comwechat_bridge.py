@@ -14,7 +14,7 @@ from urllib import request
 from urllib.error import URLError, HTTPError
 from typing import Any, Dict, Optional, Tuple
 
-from reliable_queue import ReliableQueueConfig, SQLiteMessageQueue
+from reliable_queue import MAX_PULL_ITEMS, ReliableQueueConfig, SQLiteMessageQueue
 
 
 LOGGER = logging.getLogger("comwechat_bridge")
@@ -200,7 +200,7 @@ class MessageBuffer:
             "login_anchor_total": 0,
             "probe_timeout_total": 0,
             "reordered_total": 0,
-            "overflow_drop_total": 0,
+            "overflow_released_total": 0,
         }
 
     def _phase_locked(self) -> str:
@@ -331,7 +331,7 @@ class MessageBuffer:
             if dropped is None:
                 break
             self._release_locked(dropped)
-            self._stats["overflow_drop_total"] += 1
+            self._stats["overflow_released_total"] += 1
 
     def maybe_flush_reorder(self) -> None:
         with self._cond:
@@ -394,7 +394,7 @@ class MessageBuffer:
                 "login_anchor_total": self._stats["login_anchor_total"],
                 "probe_timeout_total": self._stats["probe_timeout_total"],
                 "reordered_total": self._stats["reordered_total"],
-                "overflow_drop_total": self._stats["overflow_drop_total"],
+                "overflow_released_total": self._stats["overflow_released_total"],
             }
         durable = self.queue.snapshot()
         snapshot.update(durable)
@@ -529,13 +529,30 @@ class BridgeApiServer:
                     except (TypeError, ValueError):
                         inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
                         return
+                    max_items = min(MAX_PULL_ITEMS, max(1, max_items))
+                    wait_ms = min(60_000, max(0, wait_ms))
+                    ack_mode = bool(payload.get("ack_mode", False))
+                    consumer_id = str(
+                        payload.get("consumer_id") or "legacy-http"
+                    )[:128]
                     result = api_server.buffer.pull(
                         max_items=max_items,
                         wait_ms=wait_ms,
-                        ack_mode=bool(payload.get("ack_mode", False)),
-                        consumer_id=str(payload.get("consumer_id") or "legacy")[:128],
+                        ack_mode=True,
+                        consumer_id=consumer_id,
                     )
-                    inner_self._send_json(200, result)
+                    if ack_mode:
+                        inner_self._send_json(200, result)
+                        return
+
+                    delivery_ids = [
+                        item["delivery_id"] for item in result["deliveries"]
+                    ]
+                    legacy_result = dict(result)
+                    legacy_result["deliveries"] = []
+                    inner_self._send_json(200, legacy_result)
+                    if delivery_ids:
+                        api_server.buffer.ack(delivery_ids, consumer_id)
                     return
 
                 if inner_self.path in ("/v1/messages/ack", "/v1/messages/nack"):
@@ -684,7 +701,7 @@ class BridgeService:
         while not self.stop_event.wait(self.config.metrics_interval_seconds):
             snap = self.buffer.snapshot()
             LOGGER.info(
-                "Bridge stats phase=%s probe=%s reorder=%s normal=%s ready=%s ingress=%s ready_total=%s pulled=%s fast=%s anchors=%s probe_timeouts=%s reordered=%s dropped=%s hooks_ready=%s is_login=%s",
+                "Bridge stats phase=%s probe=%s reorder=%s normal=%s ready=%s ingress=%s ready_total=%s pulled=%s fast=%s anchors=%s probe_timeouts=%s reordered=%s overflow_released=%s hooks_ready=%s is_login=%s",
                 snap["phase"],
                 snap["probe_queue_size"],
                 snap["reorder_queue_size"],
@@ -697,7 +714,7 @@ class BridgeService:
                 snap["login_anchor_total"],
                 snap["probe_timeout_total"],
                 snap["reordered_total"],
-                snap["overflow_drop_total"],
+                snap["overflow_released_total"],
                 self.state["hooks_ready"],
                 self.state["is_login"],
             )

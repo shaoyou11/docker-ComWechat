@@ -55,7 +55,8 @@
 - [ ] Write failing API tests showing reliable pull returns aligned delivery metadata and that ACK/NACK call the queue correctly.
 - [ ] Run the targeted tests and verify the new endpoint expectations fail.
 - [ ] Wire `MessageBuffer` to stage before ordering and release when ready; recover staged rows during startup.
-- [ ] Extend the HTTP API without changing legacy pull semantics.
+- [x] Extend the HTTP API; legacy responses are acknowledged only after the
+  response body is written successfully.
 - [ ] Add database configuration environment variables and create `/var/lib/comwechat-bridge`.
 - [ ] Run all tests and verify restart recovery with a temporary database.
 - [ ] Commit Bridge integration.
@@ -145,4 +146,3 @@
 - [ ] Stream-decrypt without writing plaintext and confirm Compose plus mapping databases are present.
 - [ ] Upload ciphertext and checksum to `shaoyou11/efb-config-private`.
 - [ ] Record exact persistence, rollback tag, backup path, and remaining at-least-once duplicate boundary.
-

@@ -55,7 +55,8 @@ Compose 把该目录挂载到 NAS：
 - `dedup_key`：入站去重键，唯一索引
 - `payload`：原始消息 JSON
 - `state`：`staged`、`pending`、`inflight`、`acked` 或 `dead`
-- `received_at`、`sort_at`：接收和排序时间
+- `received_at`：接收时间
+- `sort_at`：消息释放到可投递队列时分配的顺序号，不能直接使用不可信的微信消息时间戳
 - `available_at`：允许再次投递的时间
 - `lease_token`、`lease_until`：本轮租约
 - `attempts`：租约次数
@@ -97,7 +98,10 @@ Bridge 对保留期内已经存在的去重键不重复入队。消费端同时�
 {"max_items": 50, "wait_ms": 15000}
 ```
 
-保持旧行为：返回后立即标记为 `acked`。
+兼容响应不暴露租约信息；Bridge 仅在 HTTP 响应成功写出后标记为
+`acked`。连接中断时保留租约，超时后重新投递，避免响应尚未送达就丢失消息。
+
+单次最多拉取 500 条，长轮询最长 60 秒，避免异常请求占用过多内存。
 
 ### 可靠拉取
 
@@ -200,4 +204,3 @@ Bridge 对保留期内已经存在的去重键不重复入队。消费端同时�
 4. 先升级 ComWechat，再升级 EFB。
 5. 注入测试消息，验证 ACK、重投、去重和容器重启恢复。
 6. 生成最终加密备份并上传私有 Release。
-

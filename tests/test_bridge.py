@@ -66,7 +66,28 @@ class MessageBufferTests(unittest.TestCase):
         result = buffer.pull(max_items=200, wait_ms=0)
         self.assertEqual(len(result["messages"]), 120)
         self.assertEqual(buffer.queue_size(), 0)
-        self.assertEqual(buffer.snapshot()["overflow_drop_total"], 20)
+        self.assertEqual(buffer.snapshot()["overflow_released_total"], 20)
+
+    def test_fast_path_stays_ahead_of_older_buffered_message(self):
+        buffer = MessageBuffer(config())
+        normal = {"id": "normal", "timestamp": 1}
+        fast = {
+            "id": "fast",
+            "timestamp": 9_999_999_999,
+            "isSendMsg": 1,
+            "isSendByPhone": 0,
+        }
+        buffer.ingest(normal)
+        buffer.ingest(fast)
+        buffer.emit_ready(limit=10)
+
+        result = buffer.pull(
+            max_items=10,
+            wait_ms=0,
+            ack_mode=True,
+            consumer_id="efb",
+        )
+        self.assertEqual(result["messages"], [fast, normal])
 
 
 class BridgeApiTests(unittest.TestCase):
@@ -110,6 +131,20 @@ class BridgeApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["messages"], [message])
+        self.assertEqual(payload["deliveries"], [])
+        self.assertEqual(self.buffer.snapshot()["acked_size"], 1)
+
+    def test_pull_endpoint_caps_batch_size(self):
+        for index in range(600):
+            self.buffer.ingest(
+                {"id": f"cap-{index}", "isSendMsg": 1, "isSendByPhone": 0}
+            )
+        status, payload = self.request_json(
+            "/v1/messages/pull",
+            {"max_items": 10_000, "wait_ms": 0},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["messages"]), 500)
 
     def test_reliable_pull_requires_ack_before_removal(self):
         message = {"id": "leased", "isSendMsg": 1, "isSendByPhone": 0}

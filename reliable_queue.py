@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 ACTIVE_STATES = ("staged", "pending", "inflight")
+MAX_PULL_ITEMS = 500
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,13 @@ class SQLiteMessageQueue:
             (key, amount),
         )
 
+    def _next_release_sequence_locked(self) -> int:
+        self._increment_metric_locked("release_sequence")
+        row = self._db.execute(
+            "SELECT value FROM metrics WHERE key='release_sequence'"
+        ).fetchone()
+        return int(row["value"])
+
     def _maintenance_locked(self, now: float) -> None:
         dead_cursor = self._db.execute(
             """
@@ -217,38 +225,59 @@ class SQLiteMessageQueue:
         if not ids:
             return 0
         now = self._now()
-        placeholders = ",".join("?" for _ in ids)
+        released = 0
         with self._condition:
             with self._transaction():
                 self._maintenance_locked(now)
-                cursor = self._db.execute(
-                    f"""
-                    UPDATE messages
-                       SET state='pending', available_at=?
-                     WHERE state='staged' AND id IN ({placeholders})
-                    """,
-                    [now] + ids,
-                )
-            if cursor.rowcount:
+                for message_id in ids:
+                    cursor = self._db.execute(
+                        """
+                        UPDATE messages
+                           SET state='pending', available_at=?, sort_at=?
+                         WHERE state='staged' AND id=?
+                        """,
+                        (
+                            now,
+                            self._next_release_sequence_locked(),
+                            message_id,
+                        ),
+                    )
+                    released += cursor.rowcount
+            if released:
                 self._condition.notify_all()
-            return cursor.rowcount
+            return released
 
     def release_all_staged(self) -> int:
         now = self._now()
+        released = 0
         with self._condition:
             with self._transaction():
                 self._maintenance_locked(now)
-                cursor = self._db.execute(
+                rows = self._db.execute(
                     """
-                    UPDATE messages
-                       SET state='pending', available_at=?
+                    SELECT id
+                      FROM messages
                      WHERE state='staged'
-                    """,
-                    (now,),
-                )
-            if cursor.rowcount:
+                     ORDER BY received_at, id
+                    """
+                ).fetchall()
+                for row in rows:
+                    cursor = self._db.execute(
+                        """
+                        UPDATE messages
+                           SET state='pending', available_at=?, sort_at=?
+                         WHERE state='staged' AND id=?
+                        """,
+                        (
+                            now,
+                            self._next_release_sequence_locked(),
+                            row["id"],
+                        ),
+                    )
+                    released += cursor.rowcount
+            if released:
                 self._condition.notify_all()
-            return cursor.rowcount
+            return released
 
     def recover_staged(self) -> int:
         return self.release_all_staged()
@@ -270,7 +299,7 @@ class SQLiteMessageQueue:
                  ORDER BY sort_at, received_at, id
                  LIMIT ?
                 """,
-                (now, max(1, int(max_items))),
+                (now, min(MAX_PULL_ITEMS, max(1, int(max_items)))),
             ).fetchall()
 
             messages = []
@@ -329,6 +358,32 @@ class SQLiteMessageQueue:
                 "dead_letter_size": counts.get("dead", 0),
             }
 
+    def _next_transition_delay_locked(self) -> Optional[float]:
+        now = self._now()
+        row = self._db.execute(
+            """
+            SELECT MIN(next_at) AS next_at
+              FROM (
+                    SELECT available_at AS next_at
+                      FROM messages
+                     WHERE state='pending' AND available_at > ?
+                    UNION ALL
+                    SELECT lease_until AS next_at
+                      FROM messages
+                     WHERE state='inflight' AND lease_until > ?
+                    UNION ALL
+                    SELECT expires_at AS next_at
+                      FROM messages
+                     WHERE state IN ('staged', 'pending', 'inflight')
+                       AND expires_at > ?
+                   )
+            """,
+            (now, now, now),
+        ).fetchone()
+        if row is None or row["next_at"] is None:
+            return None
+        return max(0.001, float(row["next_at"]) - now)
+
     def pull(
         self,
         max_items: int,
@@ -350,6 +405,9 @@ class SQLiteMessageQueue:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return result
+                transition_delay = self._next_transition_delay_locked()
+                if transition_delay is not None:
+                    remaining = min(remaining, transition_delay)
                 self._condition.wait(timeout=remaining)
 
     def ack(self, delivery_ids: Iterable[str], consumer_id: str) -> int:
