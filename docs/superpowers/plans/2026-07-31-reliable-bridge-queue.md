@@ -116,7 +116,7 @@
 ### Task 6: NAS Backup and Gray Deployment
 
 **Files:**
-- Modify on NAS: `/vol4/1000/docker/efb/docker-compose2.yaml`
+- Modify on NAS: `/vol4/1000/docker/efb/docker-compose.yaml`
 - Modify in private config repo: `docker-compose.example.yaml`, `.env.example`, `README.md`
 
 **Interfaces:**
