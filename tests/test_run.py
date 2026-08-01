@@ -108,6 +108,17 @@ class DockerWechatHookTests(unittest.TestCase):
         self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(2)])
 
     @mock.patch("run.time.sleep")
+    @mock.patch("run.signal.signal")
+    def test_change_version_exhaustion_requests_internal_recovery(
+        self, _signal, _sleep
+    ):
+        hook = run.DockerWechatHook()
+        failed = mock.Mock(returncode=7, stderr=b"not ready")
+        with mock.patch("run.subprocess.run", return_value=failed):
+            with self.assertRaises(run.WechatStackStartupFailed):
+                hook.change_version(attempts=2, retry_seconds=0)
+
+    @mock.patch("run.time.sleep")
     @mock.patch("run.time.monotonic", return_value=1000)
     @mock.patch("run.signal.signal")
     def test_child_exit_recovers_inside_same_container(

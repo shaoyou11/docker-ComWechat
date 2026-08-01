@@ -25,6 +25,10 @@ class ChildProcessStopped(RuntimeError):
         self.status = status
 
 
+class WechatStackStartupFailed(RuntimeError):
+    pass
+
+
 class DockerWechatHook:
     def __init__(self):
         self.vnc = None
@@ -125,7 +129,7 @@ class DockerWechatHook:
             f"Curl command failed with error: {result.stderr.decode()}",
             flush=True,
         )
-        raise RuntimeError("版本修改失败")
+        raise WechatStackStartupFailed("版本修改接口连续失败")
 
     def start_bridge(self):
         config = BridgeConfig.from_env()
@@ -215,13 +219,13 @@ class DockerWechatHook:
                     self.change_version()
                     self.start_bridge()
                     self.monitor_children()
-                except ChildProcessStopped as error:
+                except (ChildProcessStopped, WechatStackStartupFailed) as error:
                     now = time.monotonic()
                     if now - last_failure >= CHILD_RECOVERY_RESET_SECONDS:
                         recovery_failures = 0
                     recovery_failures += 1
                     last_failure = now
-                    print(f"微信栈子进程异常: {error}", flush=True)
+                    print(f"微信栈需要恢复: {error}", flush=True)
                     self.stop_wechat_stack()
                     if recovery_failures > CHILD_RECOVERY_ATTEMPTS:
                         self.wait_for_manual_restart()
