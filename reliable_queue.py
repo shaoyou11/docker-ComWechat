@@ -435,7 +435,10 @@ class SQLiteMessageQueue:
                     self._db.execute(
                         f"""
                         UPDATE messages
-                           SET state='acked', acked_at=?, lease_until=NULL
+                           SET state='acked',
+                               acked_at=?,
+                               lease_until=NULL,
+                               last_error=NULL
                          WHERE id IN ({update_placeholders})
                         """,
                         [now] + inflight_ids,
@@ -509,6 +512,57 @@ class SQLiteMessageQueue:
             if rows:
                 self._condition.notify_all()
             return len(rows)
+
+    def list_dead(self, limit: int = 20) -> List[Dict[str, Any]]:
+        now = self._now()
+        with self._condition:
+            with self._transaction():
+                self._maintenance_locked(now)
+                rows = self._db.execute(
+                    """
+                    SELECT id, dedup_key, attempts, dead_at, last_error
+                      FROM messages
+                     WHERE state='dead'
+                     ORDER BY dead_at DESC, received_at DESC
+                     LIMIT ?
+                    """,
+                    (min(100, max(1, int(limit))),),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def requeue_dead(self, message_id: str) -> bool:
+        now = self._now()
+        with self._condition:
+            with self._transaction():
+                cursor = self._db.execute(
+                    """
+                    UPDATE messages
+                       SET state='pending',
+                           available_at=?,
+                           sort_at=?,
+                           attempts=0,
+                           expires_at=?,
+                           lease_token=NULL,
+                           lease_owner=NULL,
+                           lease_until=NULL,
+                           acked_at=NULL,
+                           dead_at=NULL,
+                           last_error=NULL
+                     WHERE id=? AND state='dead'
+                    """,
+                    (
+                        now,
+                        self._next_release_sequence_locked(),
+                        now + self.config.message_ttl_seconds,
+                        str(message_id),
+                    ),
+                )
+                changed = cursor.rowcount == 1
+                if changed:
+                    self._increment_metric_locked("requeued_total")
+            if changed:
+                self._condition.notify_all()
+            return changed
 
     def _state_counts_locked(self) -> Dict[str, int]:
         return {

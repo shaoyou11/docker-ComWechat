@@ -148,6 +148,38 @@ class ReliableQueueTests(unittest.TestCase):
         self.assertEqual(queue.pull(1, 0, True, "efb")["messages"], [])
         queue.close()
 
+    def test_dead_letter_can_be_listed_and_requeued(self):
+        queue = self.queue(max_attempts=1, retry_delay_seconds=0)
+        queue.stage(self.message("dead-retry"))
+        queue.release_all_staged()
+        delivery = queue.pull(1, 0, True, "efb")["deliveries"][0]
+        queue.nack([delivery["delivery_id"]], "efb", "FileNotFoundError")
+
+        dead = queue.list_dead()
+        self.assertEqual(len(dead), 1)
+        self.assertEqual(dead[0]["last_error"], "FileNotFoundError")
+        self.assertTrue(queue.requeue_dead(dead[0]["id"]))
+        retried = queue.pull(1, 0, True, "efb")
+        self.assertEqual(retried["messages"][0]["msgid"], "dead-retry")
+        self.assertEqual(retried["deliveries"][0]["attempts"], 1)
+        queue.close()
+
+    def test_successful_ack_clears_previous_error(self):
+        queue = self.queue(retry_delay_seconds=0)
+        queue.stage(self.message("eventual-success"))
+        queue.release_all_staged()
+        first = queue.pull(1, 0, True, "efb")
+        queue.nack([first["deliveries"][0]["delivery_id"]], "efb", "temporary")
+        second = queue.pull(1, 0, True, "efb")
+        queue.ack([second["deliveries"][0]["delivery_id"]], "efb")
+
+        row = queue._db.execute(
+            "SELECT state, last_error FROM messages WHERE dedup_key=?",
+            (build_dedup_key(self.message("eventual-success")),),
+        ).fetchone()
+        self.assertEqual((row["state"], row["last_error"]), ("acked", None))
+        queue.close()
+
     def test_legacy_pull_acks_immediately(self):
         queue = self.queue()
         queue.stage(self.message())

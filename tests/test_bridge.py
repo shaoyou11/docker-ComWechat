@@ -204,6 +204,36 @@ class BridgeApiTests(unittest.TestCase):
         self.assertEqual(payload["dead_letter_size"], 0)
         self.assertIn("deduplicated_total", payload)
 
+    def test_dead_letter_endpoint_supports_manual_requeue(self):
+        self.buffer.close()
+        self.server.stop()
+        self.config = config(max_attempts=1, retry_delay_seconds=0)
+        self.buffer = MessageBuffer(self.config)
+        self.server = BridgeApiServer(self.config, self.buffer, {"hooks_ready": True})
+        self.server.start()
+        self.buffer.ingest({"id": "dead-api", "isSendMsg": 1, "isSendByPhone": 0})
+        _, pulled = self.request_json(
+            "/v1/messages/pull",
+            {"max_items": 1, "wait_ms": 0, "ack_mode": True, "consumer_id": "efb"},
+        )
+        self.request_json(
+            "/v1/messages/nack",
+            {
+                "delivery_ids": [pulled["deliveries"][0]["delivery_id"]],
+                "consumer_id": "efb",
+                "reason": "FileNotFoundError",
+            },
+        )
+
+        status, dead = self.request_json("/v1/messages/dead?limit=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(len(dead["messages"]), 1)
+        _, result = self.request_json(
+            "/v1/messages/requeue",
+            {"message_id": dead["messages"][0]["id"]},
+        )
+        self.assertEqual(result["requeued"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

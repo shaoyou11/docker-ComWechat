@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib import request
 from urllib.error import URLError, HTTPError
+from urllib.parse import parse_qs, urlparse
 from typing import Any, Dict, Optional, Tuple
 
 from reliable_queue import MAX_PULL_ITEMS, ReliableQueueConfig, SQLiteMessageQueue
@@ -380,6 +381,12 @@ class MessageBuffer:
     def nack(self, delivery_ids, consumer_id: str, reason: str) -> int:
         return self.queue.nack(delivery_ids, consumer_id, reason)
 
+    def list_dead(self, limit: int = 20):
+        return self.queue.list_dead(limit)
+
+    def requeue_dead(self, message_id: str) -> bool:
+        return self.queue.requeue_dead(message_id)
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             snapshot = {
@@ -491,7 +498,19 @@ class BridgeApiServer:
                 inner_self.wfile.write(data)
 
             def do_GET(inner_self):
-                if inner_self.path != "/healthz":
+                parsed = urlparse(inner_self.path)
+                if parsed.path == "/v1/messages/dead":
+                    try:
+                        limit = int(parse_qs(parsed.query).get("limit", ["20"])[0])
+                    except (TypeError, ValueError):
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    inner_self._send_json(
+                        200,
+                        {"ok": True, "messages": api_server.buffer.list_dead(limit)},
+                    )
+                    return
+                if parsed.path != "/healthz":
                     inner_self._send_json(404, {"ok": False, "error": "not_found"})
                     return
                 snapshot = api_server.buffer.snapshot()
@@ -576,6 +595,18 @@ class BridgeApiServer:
                             str(payload.get("reason") or ""),
                         )
                         inner_self._send_json(200, {"ok": True, "nacked": count})
+                    return
+
+                if inner_self.path == "/v1/messages/requeue":
+                    message_id = payload.get("message_id")
+                    if not isinstance(message_id, str) or not message_id:
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    requeued = api_server.buffer.requeue_dead(message_id)
+                    inner_self._send_json(
+                        200,
+                        {"ok": True, "requeued": 1 if requeued else 0},
+                    )
                     return
 
                 inner_self._send_json(404, {"ok": False, "error": "not_found"})
