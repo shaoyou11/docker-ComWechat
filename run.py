@@ -11,6 +11,18 @@ from comwechat_bridge import BridgeConfig, BridgeService
 
 
 VERSION = os.environ.get("COMWECHAT_VERSION", "3.9.12.16")
+VERSION_CHANGE_ATTEMPTS = int(os.environ.get("COMWECHAT_VERSION_CHANGE_ATTEMPTS", "6"))
+VERSION_CHANGE_RETRY_SECONDS = int(os.environ.get("COMWECHAT_VERSION_CHANGE_RETRY_SECONDS", "2"))
+CHILD_RECOVERY_ATTEMPTS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_ATTEMPTS", "3"))
+CHILD_RECOVERY_BACKOFF_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_BACKOFF_SECONDS", "5"))
+CHILD_RECOVERY_RESET_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_RESET_SECONDS", "300"))
+
+
+class ChildProcessStopped(RuntimeError):
+    def __init__(self, name, status):
+        super().__init__(f"{name} process stopped with code {status}")
+        self.name = name
+        self.status = status
 
 
 class DockerWechatHook:
@@ -73,34 +85,47 @@ class DockerWechatHook:
             ["wine", "/comwechat/http/WeChatHook.exe"]
         )
 
-    def change_version(self):
+    def change_version(
+        self,
+        attempts=VERSION_CHANGE_ATTEMPTS,
+        retry_seconds=VERSION_CHANGE_RETRY_SECONDS,
+    ):
         time.sleep(5)
-        result = subprocess.run(
-            [
-                "curl",
-                "-X",
-                "POST",
-                "http://127.0.0.1:18888/api/?type=35",
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                json.dumps(
-                    {
-                        "path": "/comwechat/http/WeChatHook.exe",
-                        "version": VERSION,
-                    }
-                ),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if result.returncode != 0:
-            print(
-                f"Curl command failed with error: {result.stderr.decode()}",
-                flush=True,
+        result = None
+        for attempt in range(1, attempts + 1):
+            result = subprocess.run(
+                [
+                    "curl",
+                    "-X",
+                    "POST",
+                    "http://127.0.0.1:18888/api/?type=35",
+                    "-H",
+                    "Content-Type: application/json",
+                    "-d",
+                    json.dumps(
+                        {
+                            "path": "/comwechat/http/WeChatHook.exe",
+                            "version": VERSION,
+                        }
+                    ),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-            raise RuntimeError("版本修改失败")
-        print("版本已经修改", flush=True)
+            if result.returncode == 0:
+                print("版本已经修改", flush=True)
+                return
+            if attempt < attempts:
+                print(
+                    f"版本修改接口暂未就绪，第 {attempt} 次重试。",
+                    flush=True,
+                )
+                time.sleep(retry_seconds)
+        print(
+            f"Curl command failed with error: {result.stderr.decode()}",
+            flush=True,
+        )
+        raise RuntimeError("版本修改失败")
 
     def start_bridge(self):
         config = BridgeConfig.from_env()
@@ -120,8 +145,28 @@ class DockerWechatHook:
                     continue
                 status = process.poll()
                 if status is not None:
-                    raise RuntimeError(f"{name} process stopped with code {status}")
+                    raise ChildProcessStopped(name, status)
             time.sleep(poll_interval)
+
+    def stop_wechat_stack(self):
+        if self.bridge is not None:
+            try:
+                self.bridge.stop()
+            except Exception as error:
+                print(f"Bridge 停止失败: {error}", flush=True)
+            self.bridge = None
+        self._terminate("Hook程序", self.reg_hook)
+        self._terminate("微信", self.wechat)
+        self.reg_hook = None
+        self.wechat = None
+
+    def wait_for_manual_restart(self):
+        print(
+            "微信栈已停止自动恢复，保留 VNC 与容器等待人工或定时重启。",
+            flush=True,
+        )
+        while not self.exiting:
+            time.sleep(60)
 
     @staticmethod
     def _terminate(name, process):
@@ -147,13 +192,7 @@ class DockerWechatHook:
             + " 正在退出容器...",
             flush=True,
         )
-        if self.bridge is not None:
-            try:
-                self.bridge.stop()
-            except Exception as error:
-                print(f"Bridge 停止失败: {error}", flush=True)
-        self._terminate("Hook程序", self.reg_hook)
-        self._terminate("微信", self.wechat)
+        self.stop_wechat_stack()
         self._terminate("VNC", self.vnc)
         if exit_code:
             raise SystemExit(exit_code)
@@ -167,11 +206,32 @@ class DockerWechatHook:
         try:
             self.prepare()
             self.run_vnc()
-            self.run_wechat()
-            self.run_hook()
-            self.change_version()
-            self.start_bridge()
-            self.monitor_children()
+            recovery_failures = 0
+            last_failure = 0.0
+            while not self.exiting:
+                try:
+                    self.run_wechat()
+                    self.run_hook()
+                    self.change_version()
+                    self.start_bridge()
+                    self.monitor_children()
+                except ChildProcessStopped as error:
+                    now = time.monotonic()
+                    if now - last_failure >= CHILD_RECOVERY_RESET_SECONDS:
+                        recovery_failures = 0
+                    recovery_failures += 1
+                    last_failure = now
+                    print(f"微信栈子进程异常: {error}", flush=True)
+                    self.stop_wechat_stack()
+                    if recovery_failures > CHILD_RECOVERY_ATTEMPTS:
+                        self.wait_for_manual_restart()
+                        return
+                    delay = CHILD_RECOVERY_BACKOFF_SECONDS * recovery_failures
+                    print(
+                        f"将在 {delay} 秒后进行第 {recovery_failures} 次容器内恢复。",
+                        flush=True,
+                    )
+                    time.sleep(delay)
         except KeyboardInterrupt:
             self.exit_container()
         except Exception as error:

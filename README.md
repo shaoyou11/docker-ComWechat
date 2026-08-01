@@ -21,6 +21,11 @@ Bridge 默认关闭，关闭时行为与现有 TCP 消息接收方式一致。
 ```yaml
 environment:
   COMWECHAT_VERSION: "3.9.12.16"
+  COMWECHAT_VERSION_CHANGE_ATTEMPTS: "6"
+  COMWECHAT_VERSION_CHANGE_RETRY_SECONDS: "2"
+  COMWECHAT_CHILD_RECOVERY_ATTEMPTS: "3"
+  COMWECHAT_CHILD_RECOVERY_BACKOFF_SECONDS: "5"
+  COMWECHAT_CHILD_RECOVERY_RESET_SECONDS: "300"
   COMWECHAT_BRIDGE_ENABLED: "true"
   COMWECHAT_BRIDGE_IN_PORT: "23456"
   COMWECHAT_BRIDGE_API_PORT: "19088"
@@ -47,7 +52,7 @@ volumes:
 兼容行为。
 
 Bridge 只负责消息 Hook 与拉取接口，不点击微信界面，也不自动重启微信。
-登录恢复仍由现有独立 Watchdog 控制，避免两套逻辑相互冲突。
+微信或 Hook 子进程意外退出时，会优先在当前容器内有限恢复，避免共享网络命名空间被重建。连续失败超过上限后停止自动尝试并保留 VNC，等待人工或定时重启；登录界面恢复仍由独立 Watchdog 控制。
 
 ## 私有运行文件
 

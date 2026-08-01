@@ -65,12 +65,15 @@ class DockerWechatHookTests(unittest.TestCase):
         hook.wechat = FakeProcess()
         hook.reg_hook = FakeProcess()
         hook.bridge = mock.Mock()
+        bridge = hook.bridge
+        wechat = hook.wechat
+        reg_hook = hook.reg_hook
         hook.exit_container()
         hook.exit_container()
-        hook.bridge.stop.assert_called_once_with()
+        bridge.stop.assert_called_once_with()
         self.assertTrue(hook.vnc.terminated)
-        self.assertTrue(hook.wechat.terminated)
-        self.assertTrue(hook.reg_hook.terminated)
+        self.assertTrue(wechat.terminated)
+        self.assertTrue(reg_hook.terminated)
 
     @mock.patch("run.time.sleep", side_effect=RuntimeError("stop"))
     @mock.patch("run.signal.signal")
@@ -91,6 +94,75 @@ class DockerWechatHookTests(unittest.TestCase):
         hook.reg_hook = FakeProcess()
         with self.assertRaisesRegex(RuntimeError, "one loop"):
             hook.monitor_children()
+
+    @mock.patch("run.time.sleep")
+    @mock.patch("run.signal.signal")
+    def test_change_version_retries_transient_failure(self, _signal, sleep):
+        hook = run.DockerWechatHook()
+        failed = mock.Mock(returncode=7, stderr=b"not ready")
+        succeeded = mock.Mock(returncode=0, stderr=b"")
+        with mock.patch("run.subprocess.run", side_effect=[failed, succeeded]) as command:
+            hook.change_version(attempts=3, retry_seconds=2)
+
+        self.assertEqual(command.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(2)])
+
+    @mock.patch("run.time.sleep")
+    @mock.patch("run.time.monotonic", return_value=1000)
+    @mock.patch("run.signal.signal")
+    def test_child_exit_recovers_inside_same_container(
+        self, _signal, _monotonic, _sleep
+    ):
+        hook = run.DockerWechatHook()
+        with mock.patch.object(hook, "prepare"), \
+                mock.patch.object(hook, "run_vnc") as run_vnc, \
+                mock.patch.object(hook, "run_wechat") as run_wechat, \
+                mock.patch.object(hook, "run_hook"), \
+                mock.patch.object(hook, "change_version"), \
+                mock.patch.object(hook, "start_bridge"), \
+                mock.patch.object(
+                    hook,
+                    "monitor_children",
+                    side_effect=[
+                        run.ChildProcessStopped("WeChat", 0),
+                        KeyboardInterrupt(),
+                    ],
+                ), \
+                mock.patch.object(hook, "stop_wechat_stack") as stop_stack, \
+                mock.patch.object(hook, "exit_container"):
+            hook.run_all_in_one()
+
+        run_vnc.assert_called_once_with()
+        self.assertEqual(run_wechat.call_count, 2)
+        stop_stack.assert_called_once_with()
+
+    @mock.patch("run.time.sleep")
+    @mock.patch("run.time.monotonic", return_value=1000)
+    @mock.patch("run.signal.signal")
+    def test_recovery_limit_waits_without_restarting_container(
+        self, _signal, _monotonic, _sleep
+    ):
+        hook = run.DockerWechatHook()
+        with mock.patch.object(hook, "prepare"), \
+                mock.patch.object(hook, "run_vnc"), \
+                mock.patch.object(hook, "run_wechat"), \
+                mock.patch.object(hook, "run_hook"), \
+                mock.patch.object(hook, "change_version"), \
+                mock.patch.object(hook, "start_bridge"), \
+                mock.patch.object(
+                    hook,
+                    "monitor_children",
+                    side_effect=run.ChildProcessStopped("WeChat", 0),
+                ) as monitor, \
+                mock.patch.object(hook, "stop_wechat_stack"), \
+                mock.patch.object(hook, "wait_for_manual_restart") as wait:
+            hook.run_all_in_one()
+
+        self.assertEqual(
+            monitor.call_count,
+            run.CHILD_RECOVERY_ATTEMPTS + 1,
+        )
+        wait.assert_called_once_with()
 
 
 if __name__ == "__main__":
