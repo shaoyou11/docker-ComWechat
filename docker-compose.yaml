@@ -4,6 +4,7 @@ services:
         container_name: comwechat
         environment:
             - VNCPASS=${COMWECHAT_VNC_PASSWORD}
+            - COMWECHAT_DEVICE_NAME=${COMWECHAT_DEVICE_NAME:-SGFu-Nas}
             - COMWECHAT=https://github.com/ljc545w/ComWeChatRobot/releases/download/3.7.0.30-0.0.5/3.7.0.30-0.0.5.zip
             - COMWECHAT_BRIDGE_ENABLED=true
         ipc: host
