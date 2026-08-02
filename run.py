@@ -255,13 +255,13 @@ class DockerWechatHook:
         try:
             self.prepare()
             self.run_vnc()
+            self.configure_device_name()
             recovery_failures = 0
             last_failure = 0.0
             while not self.exiting:
                 try:
                     self.run_wechat()
                     self.run_hook()
-                    self.configure_device_name()
                     self.change_version()
                     self.start_bridge()
                     self.monitor_children()
