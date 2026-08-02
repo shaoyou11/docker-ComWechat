@@ -16,26 +16,6 @@ VERSION_CHANGE_RETRY_SECONDS = int(os.environ.get("COMWECHAT_VERSION_CHANGE_RETR
 CHILD_RECOVERY_ATTEMPTS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_ATTEMPTS", "3"))
 CHILD_RECOVERY_BACKOFF_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_BACKOFF_SECONDS", "5"))
 CHILD_RECOVERY_RESET_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_RESET_SECONDS", "300"))
-DEVICE_NAME = os.environ.get("COMWECHAT_DEVICE_NAME", "").strip()
-
-DEVICE_NAME_REGISTRY_VALUES = (
-    (
-        r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName",
-        "ComputerName",
-    ),
-    (
-        r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName",
-        "ComputerName",
-    ),
-    (
-        r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
-        "Hostname",
-    ),
-    (
-        r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
-        "NV Hostname",
-    ),
-)
 
 
 class ChildProcessStopped(RuntimeError):
@@ -93,31 +73,6 @@ class DockerWechatHook:
                 ":5",
             ]
         )
-
-    def configure_device_name(self):
-        if not DEVICE_NAME:
-            return
-
-        for registry_key, value_name in DEVICE_NAME_REGISTRY_VALUES:
-            subprocess.run(
-                [
-                    "wine",
-                    "reg",
-                    "add",
-                    registry_key,
-                    "/v",
-                    value_name,
-                    "/t",
-                    "REG_SZ",
-                    "/d",
-                    DEVICE_NAME,
-                    "/f",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=True,
-            )
-        print(f"微信设备名称已设置为 {DEVICE_NAME}", flush=True)
 
     def run_wechat(self):
         self.wechat = subprocess.Popen(
@@ -255,7 +210,6 @@ class DockerWechatHook:
         try:
             self.prepare()
             self.run_vnc()
-            self.configure_device_name()
             recovery_failures = 0
             last_failure = 0.0
             while not self.exiting:

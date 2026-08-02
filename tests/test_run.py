@@ -59,22 +59,6 @@ class DockerWechatHookTests(unittest.TestCase):
         self.assertIs(hook.bridge, service)
 
     @mock.patch("run.signal.signal")
-    def test_configure_device_name_updates_wine_registry(self, _signal):
-        hook = run.DockerWechatHook()
-        with mock.patch.object(run, "DEVICE_NAME", "SGFu-Nas"):
-            with mock.patch("run.subprocess.run") as command:
-                hook.configure_device_name()
-
-        self.assertEqual(command.call_count, len(run.DEVICE_NAME_REGISTRY_VALUES))
-        for call, (registry_key, value_name) in zip(
-            command.call_args_list, run.DEVICE_NAME_REGISTRY_VALUES
-        ):
-            args = call.args[0]
-            self.assertEqual(args[:4], ["wine", "reg", "add", registry_key])
-            self.assertEqual(args[4:], ["/v", value_name, "/t", "REG_SZ", "/d", "SGFu-Nas", "/f"])
-            self.assertTrue(call.kwargs["check"])
-
-    @mock.patch("run.signal.signal")
     def test_shutdown_is_idempotent(self, _signal):
         hook = run.DockerWechatHook()
         hook.vnc = FakeProcess()
