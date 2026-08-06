@@ -523,6 +523,7 @@ class IngressSocketServer:
 
         addr = (self.config.ingress_host, self.config.ingress_port)
         self.server = _ThreadingIngressServer(addr, BridgeHandler)
+        self.server.daemon_threads = False
         self.server.bridge_server = self  # type: ignore[attr-defined]
         self.thread = threading.Thread(
             target=self.server.serve_forever,
@@ -681,6 +682,8 @@ class BridgeApiServer:
 
         addr = (self.config.api_host, self.config.api_port)
         self.httpd = ThreadingHTTPServer(addr, Handler)
+        # Wait for in-flight API handlers before BridgeService closes SQLite.
+        self.httpd.daemon_threads = False
         self.thread = threading.Thread(
             target=self.httpd.serve_forever,
             kwargs={"poll_interval": 0.5},

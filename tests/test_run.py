@@ -159,6 +159,20 @@ class DockerWechatHookTests(unittest.TestCase):
 
     @mock.patch("run.time.sleep")
     @mock.patch("run.signal.signal")
+    def test_change_version_allows_slow_hook_startup(self, _signal, _sleep):
+        hook = run.DockerWechatHook()
+        failed = mock.Mock(returncode=7, stderr=b"not ready")
+        succeeded = mock.Mock(returncode=0, stderr=b"")
+        with mock.patch(
+            "run.subprocess.run",
+            side_effect=[failed] * 7 + [succeeded],
+        ) as command:
+            hook.change_version(retry_seconds=0)
+
+        self.assertEqual(command.call_count, 8)
+
+    @mock.patch("run.time.sleep")
+    @mock.patch("run.signal.signal")
     def test_change_version_bounds_curl_wait(self, _signal, _sleep):
         hook = run.DockerWechatHook()
         succeeded = mock.Mock(returncode=0, stderr=b"")

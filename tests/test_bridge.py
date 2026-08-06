@@ -1,5 +1,7 @@
 import json
 import socket
+import threading
+import time
 import unittest
 from urllib import request
 
@@ -121,6 +123,7 @@ class BridgeApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["hooks_ready"])
+        self.assertFalse(self.server.httpd.daemon_threads)
 
     def test_pull_endpoint(self):
         message = {"id": "one", "isSendMsg": 1, "isSendByPhone": 0}
@@ -233,6 +236,37 @@ class BridgeApiTests(unittest.TestCase):
             {"message_id": dead["messages"][0]["id"]},
         )
         self.assertEqual(result["requeued"], 1)
+
+    def test_stop_waits_for_active_request_before_queue_close(self):
+        self.buffer.ingest({"id": "stop-race", "isSendMsg": 1, "isSendByPhone": 0})
+        ack_entered = threading.Event()
+        original_ack = self.buffer.ack
+
+        def delayed_ack(delivery_ids, consumer_id):
+            ack_entered.set()
+            time.sleep(1.0)
+            return original_ack(delivery_ids, consumer_id)
+
+        self.buffer.ack = delayed_ack
+        errors = []
+
+        def pull_message():
+            try:
+                self.request_json(
+                    "/v1/messages/pull",
+                    {"max_items": 1, "wait_ms": 0},
+                )
+            except Exception as error:  # pragma: no cover - asserted below
+                errors.append(error)
+
+        worker = threading.Thread(target=pull_message)
+        worker.start()
+        self.assertTrue(ack_entered.wait(1))
+        self.server.stop()
+        worker.join(timeout=1)
+        self.buffer.close()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":
