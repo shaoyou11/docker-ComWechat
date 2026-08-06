@@ -14,6 +14,46 @@ ACTIVE_STATES = ("staged", "pending", "inflight")
 MAX_PULL_ITEMS = 500
 
 
+def _as_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def message_priority(message: Dict[str, Any]) -> int:
+    """Return the delivery class used by the durable queue.
+
+    Private conversations are deliberately preferred after login recovery, while
+    group traffic remains ordered and is allowed to drain afterwards.
+    """
+    chat_type = _as_text(
+        message.get("chat_type") or message.get("chatType") or message.get("conversation_type")
+    ).lower()
+    group_markers = {"group", "room", "chatroom", "群聊", "群组", "微信群"}
+    if message.get("is_group") is True or message.get("isGroup") is True:
+        return 10
+    if chat_type in group_markers or any(marker in chat_type for marker in ("group", "room", "群")):
+        return 10
+    if any(message.get(key) for key in ("roomid", "room_id", "group_id", "chatroom_id")):
+        return 10
+    if chat_type in {"private", "contact", "friend", "direct", "私聊", "联系人"}:
+        return 0
+    if any(message.get(key) for key in ("sender", "from_user", "fromUser", "wxid")):
+        return 0
+    return 20
+
+
+def source_chat_key(message: Dict[str, Any]) -> str:
+    """Build a stable source conversation key for FIFO ordering."""
+    for key in (
+        "chat_id", "chatId", "conversation_id", "conversationId", "roomid",
+        "room_id", "group_id", "chatroom_id", "from_user", "fromUser", "sender",
+        "wxid", "chat",
+    ):
+        value = _as_text(message.get(key))
+        if value:
+            return value
+    return "unknown"
+
+
 @dataclass(frozen=True)
 class ReliableQueueConfig:
     db_path: str
@@ -86,6 +126,9 @@ class SQLiteMessageQueue:
                     state TEXT NOT NULL,
                     received_at REAL NOT NULL,
                     sort_at REAL NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 20,
+                    source_key TEXT NOT NULL DEFAULT 'unknown',
+                    source_sequence INTEGER NOT NULL DEFAULT 0,
                     available_at REAL NOT NULL,
                     lease_token TEXT,
                     lease_owner TEXT,
@@ -105,6 +148,22 @@ class SQLiteMessageQueue:
                     value INTEGER NOT NULL DEFAULT 0
                 );
                 """
+            )
+            columns = {
+                row[1]
+                for row in self._db.execute("PRAGMA table_info(messages)").fetchall()
+            }
+            migrations = (
+                ("priority", "INTEGER NOT NULL DEFAULT 20"),
+                ("source_key", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("source_sequence", "INTEGER NOT NULL DEFAULT 0"),
+            )
+            for name, definition in migrations:
+                if name not in columns:
+                    self._db.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_priority "
+                "ON messages(state, priority, source_key, source_sequence, received_at)"
             )
 
     def _transaction(self):
@@ -185,20 +244,33 @@ class SQLiteMessageQueue:
         self,
         message: Dict[str, Any],
         sort_at: Optional[float] = None,
+        priority: Optional[int] = None,
+        source_key: Optional[str] = None,
     ) -> Tuple[str, str, bool]:
         payload = _canonical_json(message)
         dedup_key = build_dedup_key(message)
         now = self._now()
         message_id = uuid.uuid4().hex
+        queue_priority = int(
+            message_priority(message) if priority is None else priority
+        )
+        queue_priority = max(0, min(100, queue_priority))
+        queue_source = str(source_key or message.get("_bridge_source_key") or source_chat_key(message))
         with self._condition:
             with self._transaction():
                 self._maintenance_locked(now)
+                sequence_row = self._db.execute(
+                    "SELECT COALESCE(MAX(source_sequence), 0) AS sequence "
+                    "FROM messages WHERE source_key=?",
+                    (queue_source,),
+                ).fetchone()
+                source_sequence = int(sequence_row["sequence"] or 0) + 1
                 cursor = self._db.execute(
                     """
                     INSERT OR IGNORE INTO messages(
                         id, dedup_key, payload, state, received_at, sort_at,
-                        available_at, expires_at
-                    ) VALUES(?, ?, ?, 'staged', ?, ?, ?, ?)
+                        priority, source_key, source_sequence, available_at, expires_at
+                    ) VALUES(?, ?, ?, 'staged', ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message_id,
@@ -206,6 +278,9 @@ class SQLiteMessageQueue:
                         payload,
                         now,
                         now if sort_at is None else float(sort_at),
+                        queue_priority,
+                        queue_source,
+                        source_sequence,
                         now,
                         now + self.config.message_ttl_seconds,
                     ),
@@ -293,10 +368,10 @@ class SQLiteMessageQueue:
             self._maintenance_locked(now)
             rows = self._db.execute(
                 """
-                SELECT id, dedup_key, payload, attempts
-                  FROM messages
-                 WHERE state='pending' AND available_at <= ?
-                 ORDER BY sort_at, received_at, id
+                  SELECT id, dedup_key, payload, attempts
+                    FROM messages
+                   WHERE state='pending' AND available_at <= ?
+                   ORDER BY priority, source_key, source_sequence, sort_at, received_at, id
                  LIMIT ?
                 """,
                 (now, min(MAX_PULL_ITEMS, max(1, int(max_items)))),
@@ -578,6 +653,14 @@ class SQLiteMessageQueue:
             with self._transaction():
                 self._maintenance_locked(now)
                 counts = self._state_counts_locked()
+                priority_counts = {
+                    str(row["priority"]): int(row["count"])
+                    for row in self._db.execute(
+                        "SELECT priority, COUNT(*) AS count "
+                        "FROM messages WHERE state IN ('staged', 'pending', 'inflight') "
+                        "GROUP BY priority ORDER BY priority"
+                    ).fetchall()
+                }
                 metrics = {
                     row["key"]: int(row["value"])
                     for row in self._db.execute(
@@ -594,6 +677,7 @@ class SQLiteMessageQueue:
                 "acked_total": metrics.get("acked_total", 0),
                 "deduplicated_total": metrics.get("deduplicated_total", 0),
                 "dead_lettered_total": metrics.get("dead_lettered_total", 0),
+                "priority_counts": priority_counts,
             }
 
     def close(self) -> None:

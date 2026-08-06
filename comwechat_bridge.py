@@ -15,7 +15,13 @@ from urllib.error import URLError, HTTPError
 from urllib.parse import parse_qs, urlparse
 from typing import Any, Dict, Optional, Tuple
 
-from reliable_queue import MAX_PULL_ITEMS, ReliableQueueConfig, SQLiteMessageQueue
+from reliable_queue import (
+    MAX_PULL_ITEMS,
+    ReliableQueueConfig,
+    SQLiteMessageQueue,
+    message_priority,
+    source_chat_key,
+)
 
 
 LOGGER = logging.getLogger("comwechat_bridge")
@@ -81,6 +87,43 @@ def is_fast_path(msg: Dict[str, Any]) -> bool:
 def is_login_reorder_anchor(msg: Dict[str, Any]) -> bool:
     message = msg.get("message")
     return isinstance(message, str) and '<sysmsg type="SafeModuleCfg"' in message
+
+
+def is_stable_regular_file(path: str, settle_seconds: float = 0.25) -> bool:
+    """Check that an attachment is a regular file and its size is stable."""
+    if not path:
+        return False
+    try:
+        first = os.stat(path)
+    except OSError:
+        return False
+    if not os.path.isfile(path):
+        return False
+    delay = max(0.0, float(settle_seconds))
+    if delay:
+        time.sleep(delay)
+    try:
+        second = os.stat(path)
+    except OSError:
+        return False
+    return (
+        os.path.isfile(path)
+        and first.st_size == second.st_size
+        and first.st_mtime_ns == second.st_mtime_ns
+    )
+
+
+def attachment_path(msg: Dict[str, Any]) -> str:
+    for key in ("path", "file_path", "filepath", "filePath", "local_path"):
+        value = msg.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def attachment_ready(msg: Dict[str, Any]) -> bool:
+    path = attachment_path(msg)
+    return not path or is_stable_regular_file(path, settle_seconds=0.01)
 
 
 @dataclass
@@ -220,7 +263,12 @@ class MessageBuffer:
         received_ts = time.time()
         ingress_ts = time.monotonic()
         sort_ts = extract_sort_ts(msg, received_ts)
-        message_id, _, inserted = self.queue.stage(msg, sort_at=sort_ts)
+        message_id, _, inserted = self.queue.stage(
+            msg,
+            sort_at=sort_ts,
+            priority=1 if is_fast_path(msg) else message_priority(msg),
+            source_key=source_chat_key(msg),
+        )
         with self._cond:
             self._stats["ingress_total"] += 1
             if not inserted:
@@ -229,15 +277,21 @@ class MessageBuffer:
             queued_msg["_bridge_queue_id"] = message_id
             self._flush_probe_if_expired_locked(ingress_ts)
             if is_fast_path(msg):
-                self._release_locked(queued_msg)
+                if attachment_ready(msg):
+                    self._release_locked(queued_msg)
+                    self._stats["ready_total"] += 1
+                else:
+                    self._normal_queue.append(queued_msg)
                 self._stats["fast_path_total"] += 1
-                self._stats["ready_total"] += 1
             elif is_login_reorder_anchor(msg):
                 self._close_reorder_window_locked("reset")
                 self._move_probe_into_reorder_locked()
-                self._release_locked(queued_msg)
+                if attachment_ready(msg):
+                    self._release_locked(queued_msg)
+                    self._stats["ready_total"] += 1
+                else:
+                    self._normal_queue.append(queued_msg)
                 self._stats["login_anchor_total"] += 1
-                self._stats["ready_total"] += 1
                 self._open_reorder_window_locked(ingress_ts)
             elif self._reorder_active:
                 heapq.heappush(self._reorder_heap, (sort_ts, self._seq, queued_msg))
@@ -349,10 +403,20 @@ class MessageBuffer:
     def emit_ready(self, limit: int) -> int:
         moved = 0
         with self._cond:
-            while self._normal_queue and moved < limit:
-                self._release_locked(self._normal_queue.popleft())
+            deferred = deque()
+            checked = 0
+            initial_size = len(self._normal_queue)
+            while self._normal_queue and moved < limit and checked < initial_size:
+                candidate = self._normal_queue.popleft()
+                checked += 1
+                path = attachment_path(candidate)
+                if path and not is_stable_regular_file(path, settle_seconds=0.01):
+                    deferred.append(candidate)
+                    continue
+                self._release_locked(candidate)
                 moved += 1
                 self._stats["ready_total"] += 1
+            self._normal_queue.extendleft(reversed(deferred))
             if moved:
                 self._cond.notify_all()
         return moved
@@ -525,6 +589,7 @@ class BridgeApiServer:
                         "dead_letter_size": snapshot["dead_letter_size"],
                         "acked_total": snapshot["acked_total"],
                         "deduplicated_total": snapshot["deduplicated_total"],
+                        "priority_counts": snapshot.get("priority_counts", {}),
                     },
                 )
 
