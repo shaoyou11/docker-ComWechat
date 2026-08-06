@@ -13,6 +13,12 @@ from comwechat_bridge import BridgeConfig, BridgeService
 VERSION = os.environ.get("COMWECHAT_VERSION", "3.9.12.16")
 VERSION_CHANGE_ATTEMPTS = int(os.environ.get("COMWECHAT_VERSION_CHANGE_ATTEMPTS", "6"))
 VERSION_CHANGE_RETRY_SECONDS = int(os.environ.get("COMWECHAT_VERSION_CHANGE_RETRY_SECONDS", "2"))
+VERSION_CHANGE_CONNECT_TIMEOUT_SECONDS = int(
+    os.environ.get("COMWECHAT_VERSION_CHANGE_CONNECT_TIMEOUT_SECONDS", "3")
+)
+VERSION_CHANGE_MAX_TIME_SECONDS = int(
+    os.environ.get("COMWECHAT_VERSION_CHANGE_MAX_TIME_SECONDS", "10")
+)
 CHILD_RECOVERY_ATTEMPTS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_ATTEMPTS", "3"))
 CHILD_RECOVERY_BACKOFF_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_BACKOFF_SECONDS", "5"))
 CHILD_RECOVERY_RESET_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_RESET_SECONDS", "300"))
@@ -100,6 +106,11 @@ class DockerWechatHook:
             result = subprocess.run(
                 [
                     "curl",
+                    "--fail",
+                    "--connect-timeout",
+                    str(VERSION_CHANGE_CONNECT_TIMEOUT_SECONDS),
+                    "--max-time",
+                    str(VERSION_CHANGE_MAX_TIME_SECONDS),
                     "-X",
                     "POST",
                     "http://127.0.0.1:18888/api/?type=35",

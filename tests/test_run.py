@@ -109,6 +109,19 @@ class DockerWechatHookTests(unittest.TestCase):
 
     @mock.patch("run.time.sleep")
     @mock.patch("run.signal.signal")
+    def test_change_version_bounds_curl_wait(self, _signal, _sleep):
+        hook = run.DockerWechatHook()
+        succeeded = mock.Mock(returncode=0, stderr=b"")
+        with mock.patch("run.subprocess.run", return_value=succeeded) as command:
+            hook.change_version(attempts=1, retry_seconds=0)
+
+        args = command.call_args.args[0]
+        self.assertIn("--fail", args)
+        self.assertIn("--connect-timeout", args)
+        self.assertIn("--max-time", args)
+
+    @mock.patch("run.time.sleep")
+    @mock.patch("run.signal.signal")
     def test_change_version_exhaustion_requests_internal_recovery(
         self, _signal, _sleep
     ):
