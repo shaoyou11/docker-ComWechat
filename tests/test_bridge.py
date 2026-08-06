@@ -1,5 +1,7 @@
 import json
+import os
 import socket
+import tempfile
 import threading
 import time
 import unittest
@@ -59,6 +61,55 @@ class MessageBufferTests(unittest.TestCase):
         buffer.ingest(message)
         result = buffer.pull(max_items=10, wait_ms=0)
         self.assertEqual(result["messages"], [message])
+
+    def test_cache_share_link_does_not_wait_for_optional_attachment(self):
+        buffer = MessageBuffer(config())
+        message = {
+            "id": "share-cache",
+            "type": 49,
+            "filepath": r"shaoyou11\FileStorage\Cache\2026-08\missing.jpg",
+        }
+        buffer.ingest(message)
+        buffer.emit_ready(limit=10)
+
+        self.assertEqual(
+            buffer.pull(max_items=10, wait_ms=0)["messages"], [message]
+        )
+
+    def test_file_share_still_waits_for_attachment(self):
+        buffer = MessageBuffer(config(attachment_wait_timeout_seconds=30.0))
+        message = {
+            "id": "share-file",
+            "type": 49,
+            "filepath": r"shaoyou11\FileStorage\MsgAttach\file.bin",
+        }
+        buffer.ingest(message)
+        buffer.emit_ready(limit=10)
+
+        self.assertEqual(buffer.pull(max_items=10, wait_ms=0)["messages"], [])
+
+    def test_windows_relative_attachment_is_resolved_under_attachment_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            relative_path = os.path.join(
+                "shaoyou11", "FileStorage", "MsgAttach", "image.dat"
+            )
+            absolute_path = os.path.join(directory, relative_path)
+            os.makedirs(os.path.dirname(absolute_path))
+            with open(absolute_path, "wb") as attachment:
+                attachment.write(b"image")
+
+            buffer = MessageBuffer(config(attachment_root=directory))
+            message = {
+                "id": "image",
+                "type": 3,
+                "filepath": relative_path.replace("/", "\\"),
+            }
+            buffer.ingest(message)
+            buffer.emit_ready(limit=10)
+
+            self.assertEqual(
+                buffer.pull(max_items=10, wait_ms=0)["messages"], [message]
+            )
 
     def test_overflow_is_bounded(self):
         buffer = MessageBuffer(config(max_buffer=100))
@@ -123,6 +174,22 @@ class BridgeApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["hooks_ready"])
+
+    def test_active_endpoint_lists_message_summary(self):
+        self.buffer.ingest({
+            "id": "active",
+            "type": 49,
+            "sender": "wxid-source",
+            "filepath": r"account\FileStorage\Cache\article.jpg",
+            "content": "article content",
+        })
+        status, payload = self.request_json("/v1/messages/active?limit=10")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["messages"][0]["state"], "staged")
+        self.assertEqual(payload["messages"][0]["message"]["type"], 49)
+        self.assertEqual(payload["messages"][0]["message"]["sender"], "wxid-source")
+        self.assertEqual(payload["messages"][0]["message"]["content"], "article content")
         self.assertFalse(self.server.httpd.daemon_threads)
 
     def test_pull_endpoint(self):

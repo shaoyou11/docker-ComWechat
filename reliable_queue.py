@@ -605,6 +605,61 @@ class SQLiteMessageQueue:
                 ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_active(self, limit: int = 20) -> List[Dict[str, Any]]:
+        now = self._now()
+        with self._condition:
+            with self._transaction():
+                self._maintenance_locked(now)
+                rows = self._db.execute(
+                    """
+                    SELECT id, state, received_at, sort_at, available_at,
+                           attempts, lease_until, last_error, priority,
+                           source_key, payload
+                      FROM messages
+                     WHERE state IN ('staged', 'pending', 'inflight')
+                     ORDER BY priority ASC, sort_at ASC, received_at ASC
+                     LIMIT ?
+                    """,
+                    (min(100, max(1, int(limit))),),
+                ).fetchall()
+
+        records = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            records.append(
+                {
+                    "id": row["id"],
+                    "state": row["state"],
+                    "received_at": row["received_at"],
+                    "available_at": row["available_at"],
+                    "attempts": row["attempts"],
+                    "last_error": row["last_error"],
+                    "priority": row["priority"],
+                    "source_key": row["source_key"],
+                    "message": {
+                        "type": payload.get("type"),
+                        "msgid": payload.get("msgid") or payload.get("id"),
+                        "sender": payload.get("sender"),
+                        "wxid": payload.get("wxid"),
+                        "filepath": payload.get("filepath") or payload.get("path"),
+                        "thumb_path": payload.get("thumb_path"),
+                        "timestamp": payload.get("timestamp") or payload.get("time"),
+                        "content": str(
+                            payload.get("message")
+                            or payload.get("content")
+                            or payload.get("text")
+                            or ""
+                        )[:200],
+                    },
+                }
+            )
+        return records
+
     def requeue_dead(self, message_id: str) -> bool:
         now = self._now()
         with self._condition:
