@@ -1,5 +1,7 @@
 import json
+import os
 import socket
+import tempfile
 import threading
 import time
 import unittest
@@ -39,6 +41,8 @@ def config(**overrides):
         "hook_retry_times": 1,
         "hook_retry_interval_seconds": 0.1,
         "metrics_interval_seconds": 10,
+        "attachment_root": "",
+        "attachment_wait_timeout_seconds": 30.0,
     }
     values.update(overrides)
     return BridgeConfig(**values)
@@ -90,6 +94,40 @@ class MessageBufferTests(unittest.TestCase):
             consumer_id="efb",
         )
         self.assertEqual(result["messages"], [fast, normal])
+
+
+    def test_windows_relative_attachment_is_resolved_under_attachment_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            relative_path = os.path.join(
+                "account", "FileStorage", "MsgAttach", "image.dat"
+            )
+            absolute_path = os.path.join(directory, relative_path)
+            os.makedirs(os.path.dirname(absolute_path))
+            with open(absolute_path, "wb") as attachment:
+                attachment.write(b"image")
+
+            buffer = MessageBuffer(config(attachment_root=directory))
+            message = {
+                "id": "image",
+                "type": 3,
+                "filepath": relative_path.replace("/", "\\"),
+            }
+            buffer.ingest(message)
+            buffer.emit_ready(limit=10)
+
+            self.assertEqual(
+                buffer.pull(max_items=10, wait_ms=0)["messages"], [message]
+            )
+
+    def test_missing_attachment_is_released_after_wait_timeout(self):
+        buffer = MessageBuffer(config(attachment_wait_timeout_seconds=0.0))
+        message = {"id": "link", "type": 49, "filepath": "missing\\cover.dat"}
+        buffer.ingest(message)
+        buffer.emit_ready(limit=10)
+
+        self.assertEqual(
+            buffer.pull(max_items=10, wait_ms=0)["messages"], [message]
+        )
 
 
 class BridgeApiTests(unittest.TestCase):
