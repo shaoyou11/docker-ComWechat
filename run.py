@@ -93,10 +93,24 @@ class DockerWechatHook:
     def run_hook(self):
         print("等待 5 秒再 hook", flush=True)
         time.sleep(5)
+        self._clear_hook_port()
         self.reg_hook = subprocess.Popen(
             ["wine", "/comwechat/http/WeChatHook.exe"],
             start_new_session=True,
         )
+
+    @staticmethod
+    def _clear_hook_port():
+        port = os.environ.get("COMWECHAT_API_PORT", "18888")
+        try:
+            subprocess.run(
+                ["fuser", "-k", f"{port}/tcp"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            pass
 
     def change_version(
         self,

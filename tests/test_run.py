@@ -60,12 +60,32 @@ class DockerWechatHookTests(unittest.TestCase):
 
     @mock.patch("run.time.sleep")
     @mock.patch("run.subprocess.Popen")
+    @mock.patch("run.subprocess.run")
     @mock.patch("run.signal.signal")
-    def test_hook_starts_in_a_new_process_group(self, _signal, popen, _sleep):
+    def test_hook_starts_in_a_new_process_group(
+        self, _signal, _command, popen, _sleep
+    ):
         hook = run.DockerWechatHook()
         hook.run_hook()
 
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    @mock.patch("run.time.sleep")
+    @mock.patch("run.subprocess.Popen")
+    @mock.patch("run.subprocess.run")
+    @mock.patch("run.signal.signal")
+    def test_hook_clears_stale_api_listener_before_starting(
+        self, _signal, command, popen, _sleep
+    ):
+        hook = run.DockerWechatHook()
+        hook.run_hook()
+
+        command.assert_any_call(
+            ["fuser", "-k", "18888/tcp"],
+            stdout=run.subprocess.DEVNULL,
+            stderr=run.subprocess.DEVNULL,
+            check=False,
+        )
 
     @mock.patch("run.os.killpg")
     @mock.patch("run.signal.signal")
