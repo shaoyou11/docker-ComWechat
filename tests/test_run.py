@@ -58,6 +58,36 @@ class DockerWechatHookTests(unittest.TestCase):
         service.start.assert_called_once_with()
         self.assertIs(hook.bridge, service)
 
+    @mock.patch("run.time.sleep")
+    @mock.patch("run.subprocess.Popen")
+    @mock.patch("run.signal.signal")
+    def test_hook_starts_in_a_new_process_group(self, _signal, popen, _sleep):
+        hook = run.DockerWechatHook()
+        hook.run_hook()
+
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    @mock.patch("run.os.killpg")
+    @mock.patch("run.signal.signal")
+    def test_terminate_escalates_and_waits_for_process_group(self, _signal, killpg):
+        hook = run.DockerWechatHook()
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = None
+        process.wait.side_effect = [
+            run.subprocess.TimeoutExpired("Hook", 10),
+            None,
+        ]
+
+        hook._terminate("Hook程序", process)
+
+        killpg.assert_has_calls(
+            [
+                mock.call(4321, run.signal.SIGTERM),
+                mock.call(4321, run.signal.SIGKILL),
+            ]
+        )
+        self.assertEqual(process.wait.call_args_list, [mock.call(timeout=10), mock.call(timeout=5)])
+
     @mock.patch("run.signal.signal")
     def test_shutdown_is_idempotent(self, _signal):
         hook = run.DockerWechatHook()

@@ -77,7 +77,8 @@ class DockerWechatHook:
                 "-xstartup",
                 "/usr/bin/openbox",
                 ":5",
-            ]
+            ],
+            start_new_session=True,
         )
 
     def run_wechat(self):
@@ -85,14 +86,16 @@ class DockerWechatHook:
             [
                 "wine",
                 "/home/user/.wine/drive_c/Program Files/Tencent/WeChat/WeChat.exe",
-            ]
+            ],
+            start_new_session=True,
         )
 
     def run_hook(self):
         print("等待 5 秒再 hook", flush=True)
         time.sleep(5)
         self.reg_hook = subprocess.Popen(
-            ["wine", "/comwechat/http/WeChatHook.exe"]
+            ["wine", "/comwechat/http/WeChatHook.exe"],
+            start_new_session=True,
         )
 
     def change_version(
@@ -194,9 +197,34 @@ class DockerWechatHook:
                     + f" 退出{name}...",
                     flush=True,
                 )
-                process.terminate()
+                DockerWechatHook._signal_process(process, signal.SIGTERM)
+                wait = getattr(process, "wait", None)
+                if wait is None:
+                    return
+                try:
+                    wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    DockerWechatHook._signal_process(process, signal.SIGKILL)
+                    try:
+                        wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
         except (OSError, ProcessLookupError):
             pass
+
+    @staticmethod
+    def _signal_process(process, signum):
+        pid = getattr(process, "pid", None)
+        if pid is not None:
+            try:
+                os.killpg(pid, signum)
+                return
+            except (OSError, ProcessLookupError):
+                pass
+        if signum == signal.SIGKILL:
+            process.kill()
+        else:
+            process.terminate()
 
     def exit_container(self, exit_code=0):
         if self.exiting:
