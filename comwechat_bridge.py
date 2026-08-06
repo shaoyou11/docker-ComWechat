@@ -121,9 +121,25 @@ def attachment_path(msg: Dict[str, Any]) -> str:
     return ""
 
 
-def attachment_ready(msg: Dict[str, Any]) -> bool:
+def attachment_candidate_paths(path: str, attachment_root: str = "") -> list[str]:
+    if not path:
+        return []
+    normalized = path.replace("\\", "/")
+    candidates = [normalized]
+    marker = "/WeChat Files/"
+    if marker in normalized:
+        normalized = normalized.split(marker, 1)[1]
+    if attachment_root and not normalized.startswith("/"):
+        candidates.append(os.path.join(attachment_root, normalized))
+    return list(dict.fromkeys(candidates))
+
+
+def attachment_ready(msg: Dict[str, Any], attachment_root: str = "") -> bool:
     path = attachment_path(msg)
-    return not path or is_stable_regular_file(path, settle_seconds=0.01)
+    return not path or any(
+        is_stable_regular_file(candidate, settle_seconds=0.01)
+        for candidate in attachment_candidate_paths(path, attachment_root)
+    )
 
 
 @dataclass
@@ -143,6 +159,8 @@ class BridgeConfig:
     hook_retry_times: int
     hook_retry_interval_seconds: float
     metrics_interval_seconds: int
+    attachment_root: str = "/home/user/.wine/drive_c/users/user/My Documents/WeChat Files"
+    attachment_wait_timeout_seconds: float = 30.0
     db_path: str = ":memory:"
     lease_seconds: int = 120
     max_attempts: int = 10
@@ -178,6 +196,14 @@ class BridgeConfig:
             ),
             metrics_interval_seconds=max(
                 1, _env_int("COMWECHAT_BRIDGE_METRICS_INTERVAL_SECONDS", 10)
+            ),
+            attachment_root=os.environ.get(
+                "COMWECHAT_BRIDGE_ATTACHMENT_ROOT",
+                "/home/user/.wine/drive_c/users/user/My Documents/WeChat Files",
+            ),
+            attachment_wait_timeout_seconds=max(
+                0.0,
+                _env_float("COMWECHAT_BRIDGE_ATTACHMENT_WAIT_TIMEOUT_SECONDS", 30.0),
             ),
             db_path=os.environ.get(
                 "COMWECHAT_BRIDGE_DB_PATH",
@@ -275,9 +301,10 @@ class MessageBuffer:
                 return
             queued_msg = dict(msg)
             queued_msg["_bridge_queue_id"] = message_id
+            queued_msg["_bridge_staged_monotonic"] = ingress_ts
             self._flush_probe_if_expired_locked(ingress_ts)
             if is_fast_path(msg):
-                if attachment_ready(msg):
+                if attachment_ready(msg, self.config.attachment_root):
                     self._release_locked(queued_msg)
                     self._stats["ready_total"] += 1
                 else:
@@ -286,7 +313,7 @@ class MessageBuffer:
             elif is_login_reorder_anchor(msg):
                 self._close_reorder_window_locked("reset")
                 self._move_probe_into_reorder_locked()
-                if attachment_ready(msg):
+                if attachment_ready(msg, self.config.attachment_root):
                     self._release_locked(queued_msg)
                     self._stats["ready_total"] += 1
                 else:
@@ -410,7 +437,16 @@ class MessageBuffer:
                 candidate = self._normal_queue.popleft()
                 checked += 1
                 path = attachment_path(candidate)
-                if path and not is_stable_regular_file(path, settle_seconds=0.01):
+                staged_at = float(candidate.get("_bridge_staged_monotonic", 0.0))
+                wait_expired = (
+                    time.monotonic() - staged_at
+                    >= self.config.attachment_wait_timeout_seconds
+                )
+                if (
+                    path
+                    and not attachment_ready(candidate, self.config.attachment_root)
+                    and not wait_expired
+                ):
                     deferred.append(candidate)
                     continue
                 self._release_locked(candidate)
