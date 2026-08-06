@@ -10,7 +10,6 @@ on:
       - "VERSION"
       - "run.py"
       - "comwechat_bridge.py"
-      - "reliable_queue.py"
       - "healthcheck.py"
       - "tests/**"
   workflow_dispatch:
