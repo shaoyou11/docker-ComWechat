@@ -497,6 +497,18 @@ class MessageBuffer:
     def requeue_dead(self, message_id: str) -> bool:
         return self.queue.requeue_dead(message_id)
 
+    def retry_active(self, message_id: str) -> str:
+        return self.queue.retry_active(message_id)
+
+    def discard_message(self, message_id: str, reason: str = "") -> str:
+        return self.queue.discard_message(message_id, reason)
+
+    def requeue_all_dead(self) -> int:
+        return self.queue.requeue_all_dead()
+
+    def discard_all_dead(self, reason: str = "") -> int:
+        return self.queue.discard_all_dead(reason)
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             snapshot = {
@@ -646,6 +658,7 @@ class BridgeApiServer:
                         "pending_size": snapshot["pending_size"],
                         "inflight_size": snapshot["inflight_size"],
                         "dead_letter_size": snapshot["dead_letter_size"],
+                        "discarded_size": snapshot["discarded_size"],
                         "acked_total": snapshot["acked_total"],
                         "deduplicated_total": snapshot["deduplicated_total"],
                         "priority_counts": snapshot.get("priority_counts", {}),
@@ -663,6 +676,9 @@ class BridgeApiServer:
                     payload = json.loads(body.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     inner_self._send_json(400, {"ok": False, "error": "invalid_json"})
+                    return
+                if not isinstance(payload, dict):
+                    inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
                     return
 
                 if inner_self.path == "/v1/messages/pull":
@@ -731,6 +747,43 @@ class BridgeApiServer:
                         200,
                         {"ok": True, "requeued": 1 if requeued else 0},
                     )
+                    return
+
+                if inner_self.path == "/v1/messages/retry-active":
+                    message_id = payload.get("message_id")
+                    if not isinstance(message_id, str) or not message_id:
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    result = api_server.buffer.retry_active(message_id)
+                    inner_self._send_json(200, {"ok": True, "result": result})
+                    return
+
+                if inner_self.path == "/v1/messages/discard":
+                    message_id = payload.get("message_id")
+                    reason = payload.get("reason", "admin")
+                    if (
+                        not isinstance(message_id, str)
+                        or not message_id
+                        or not isinstance(reason, str)
+                    ):
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    result = api_server.buffer.discard_message(message_id, reason)
+                    inner_self._send_json(200, {"ok": True, "result": result})
+                    return
+
+                if inner_self.path == "/v1/messages/requeue-all-dead":
+                    requeued = api_server.buffer.requeue_all_dead()
+                    inner_self._send_json(200, {"ok": True, "requeued": requeued})
+                    return
+
+                if inner_self.path == "/v1/messages/discard-all-dead":
+                    reason = payload.get("reason", "admin")
+                    if not isinstance(reason, str):
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    discarded = api_server.buffer.discard_all_dead(reason)
+                    inner_self._send_json(200, {"ok": True, "discarded": discarded})
                     return
 
                 inner_self._send_json(404, {"ok": False, "error": "not_found"})
