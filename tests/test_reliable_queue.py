@@ -167,11 +167,43 @@ class ReliableQueueTests(unittest.TestCase):
     def test_retry_active_releases_pending_message_immediately(self):
         queue = self.queue()
         message_id, _, _ = queue.stage(self.message("active-retry"))
+        queue.release([message_id])
 
         self.assertEqual(queue.retry_active(message_id), "retried")
         result = queue.pull(1, 0, True, "efb")
 
         self.assertEqual(result["messages"][0]["msgid"], "active-retry")
+        queue.close()
+
+    def test_retry_active_does_not_bypass_staged_attachment_state(self):
+        queue = self.queue()
+        message_id, _, _ = queue.stage(self.message("staged-retry"))
+
+        self.assertEqual(queue.retry_active(message_id), "not_found")
+        self.assertEqual(queue.snapshot()["staged_size"], 1)
+        queue.close()
+
+    def test_active_batch_operations_leave_inflight_untouched(self):
+        queue = self.queue()
+        inflight_id, _, _ = queue.stage(self.message("inflight-batch"))
+        queue.release([inflight_id])
+        pending_id, _, _ = queue.stage(self.message("pending-batch"))
+        queue.release([pending_id])
+        staged_id, _, _ = queue.stage(self.message("staged-batch"))
+        queue.pull(1, 0, True, "efb")
+
+        self.assertEqual(queue.retry_all_active(), 1)
+        self.assertEqual(queue.discard_all_active("admin"), 2)
+        states = {
+            row["id"]: row["state"]
+            for row in queue._db.execute(
+                "SELECT id, state FROM messages WHERE id IN (?, ?, ?)",
+                (pending_id, staged_id, inflight_id),
+            ).fetchall()
+        }
+        self.assertEqual(states[pending_id], "discarded")
+        self.assertEqual(states[staged_id], "discarded")
+        self.assertEqual(states[inflight_id], "inflight")
         queue.close()
 
     def test_retry_active_rejects_inflight_message(self):

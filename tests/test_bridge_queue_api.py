@@ -87,6 +87,7 @@ class BridgeQueueApiTests(unittest.TestCase):
         self.buffer.ingest({"id": "active-route"})
         _, active = self.request_json("/v1/messages/active?limit=10")
         message_id = active["messages"][0]["id"]
+        self.buffer.queue.release([message_id])
 
         status, retried = self.request_json(
             "/v1/messages/retry-active", {"message_id": message_id}
@@ -124,7 +125,9 @@ class BridgeQueueApiTests(unittest.TestCase):
 
         status, result = self.request_json("/v1/messages/requeue-all-dead", {})
         self.assertEqual(status, 200)
-        self.assertEqual(result, {"ok": True, "requeued": 1})
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(result["requeued"], 1)
+        self.assertEqual(len(result["message_ids"]), 1)
 
         _, pulled = self.request_json(
             "/v1/messages/pull",
@@ -142,7 +145,9 @@ class BridgeQueueApiTests(unittest.TestCase):
             "/v1/messages/discard-all-dead", {"reason": "admin batch"}
         )
         self.assertEqual(status, 200)
-        self.assertEqual(discarded, {"ok": True, "discarded": 1})
+        self.assertEqual(discarded["ok"], True)
+        self.assertEqual(discarded["discarded"], 1)
+        self.assertEqual(len(discarded["message_ids"]), 1)
 
         status, health = self.request_json("/healthz")
         self.assertEqual(status, 200)
@@ -156,6 +161,36 @@ class BridgeQueueApiTests(unittest.TestCase):
             status, payload = self.request_json(path, {})
             self.assertEqual(status, 400)
             self.assertEqual(payload["error"], "invalid_arguments")
+
+    def test_active_batch_routes_only_touch_safe_states(self):
+        self.buffer.ingest({"id": "batch-pending"})
+        _, active = self.request_json("/v1/messages/active?limit=10")
+        pending_id = active["messages"][0]["id"]
+        self.buffer.queue.release([pending_id])
+
+        status, retried = self.request_json("/v1/messages/retry-all-active", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(retried, {"ok": True, "retried": 1})
+
+        status, discarded = self.request_json(
+            "/v1/messages/discard-all-active", {"reason": "admin batch"}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(discarded, {"ok": True, "discarded": 1})
+
+    def test_pull_and_ack_validation_is_strict_and_bounded(self):
+        for payload in (
+            {"max_items": "1"},
+            {"wait_ms": True},
+            {"ack_mode": "yes"},
+            {"consumer_id": " "},
+            {"delivery_ids": []},
+            {"delivery_ids": ["x"] * 501, "consumer_id": "efb"},
+        ):
+            path = "/v1/messages/pull" if "delivery_ids" not in payload else "/v1/messages/ack"
+            status, result = self.request_json(path, payload)
+            self.assertEqual(status, 400)
+            self.assertEqual(result["error"], "invalid_arguments")
 
 
 if __name__ == "__main__":

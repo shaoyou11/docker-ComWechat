@@ -32,6 +32,27 @@ if not LOGGER.handlers:
     )
 
 
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+MAX_DELIVERY_IDS = 500
+MAX_IDENTIFIER_LENGTH = 128
+
+
+def _loopback_host(value: str) -> str:
+    host = str(value or "127.0.0.1").strip().lower()
+    if host in LOOPBACK_HOSTS:
+        return host
+    LOGGER.warning("Bridge API host must be loopback; forcing 127.0.0.1 instead of %s", host)
+    return "127.0.0.1"
+
+
+def _valid_identifier(value: Any, max_length: int = MAX_IDENTIFIER_LENGTH) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value) <= max_length
+    )
+
+
 def _env_int(name: str, default: int) -> int:
     value = os.environ.get(name, str(default))
     try:
@@ -185,7 +206,9 @@ class BridgeConfig:
             enabled=_env_bool("COMWECHAT_BRIDGE_ENABLED", False),
             ingress_host=os.environ.get("COMWECHAT_BRIDGE_IN_HOST", "0.0.0.0"),
             ingress_port=_env_int("COMWECHAT_BRIDGE_IN_PORT", 23456),
-            api_host=os.environ.get("COMWECHAT_BRIDGE_API_HOST", "0.0.0.0"),
+            api_host=_loopback_host(
+                os.environ.get("COMWECHAT_BRIDGE_API_HOST", "127.0.0.1")
+            ),
             api_port=_env_int("COMWECHAT_BRIDGE_API_PORT", 19088),
             comwechat_api_port=_env_int("COMWECHAT_API_PORT", 18888),
             hook_save_path=os.environ.get(
@@ -491,8 +514,8 @@ class MessageBuffer:
     def nack(self, delivery_ids, consumer_id: str, reason: str) -> int:
         return self.queue.nack(delivery_ids, consumer_id, reason)
 
-    def list_dead(self, limit: int = 20):
-        return self.queue.list_dead(limit)
+    def list_dead(self, limit: int = 20, offset: int = 0):
+        return self.queue.list_dead(limit, offset)
 
     def requeue_dead(self, message_id: str) -> bool:
         return self.queue.requeue_dead(message_id)
@@ -500,14 +523,26 @@ class MessageBuffer:
     def retry_active(self, message_id: str) -> str:
         return self.queue.retry_active(message_id)
 
+    def retry_all_active(self) -> int:
+        return self.queue.retry_all_active()
+
     def discard_message(self, message_id: str, reason: str = "") -> str:
         return self.queue.discard_message(message_id, reason)
 
     def requeue_all_dead(self) -> int:
         return self.queue.requeue_all_dead()
 
+    def requeue_all_dead_with_ids(self):
+        return self.queue.requeue_all_dead_with_ids()
+
     def discard_all_dead(self, reason: str = "") -> int:
         return self.queue.discard_all_dead(reason)
+
+    def discard_all_dead_with_ids(self, reason: str = ""):
+        return self.queue.discard_all_dead_with_ids(reason)
+
+    def discard_all_active(self, reason: str = "") -> int:
+        return self.queue.discard_all_active(reason)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -610,6 +645,8 @@ class BridgeApiServer:
 
     def start(self) -> None:
         api_server = self
+        if self.config.api_host not in LOOPBACK_HOSTS:
+            raise ValueError("Bridge API must bind to loopback")
 
         class Handler(BaseHTTPRequestHandler):
             def _send_json(inner_self, code: int, payload: Dict[str, Any]) -> None:
@@ -624,24 +661,43 @@ class BridgeApiServer:
                 parsed = urlparse(inner_self.path)
                 if parsed.path == "/v1/messages/dead":
                     try:
-                        limit = int(parse_qs(parsed.query).get("limit", ["20"])[0])
+                        query = parse_qs(parsed.query)
+                        limit = int(query.get("limit", ["20"])[0])
+                        offset = int(query.get("offset", ["0"])[0])
                     except (TypeError, ValueError):
                         inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
                         return
+                    limit = min(100, max(1, limit))
+                    offset = max(0, offset)
                     inner_self._send_json(
                         200,
-                        {"ok": True, "messages": api_server.buffer.list_dead(limit)},
+                        {
+                            "ok": True,
+                            "messages": api_server.buffer.list_dead(limit, offset),
+                            "total": api_server.buffer.queue.count_state("dead"),
+                        },
                     )
                     return
                 if parsed.path == "/v1/messages/active":
                     try:
-                        limit = int(parse_qs(parsed.query).get("limit", ["20"])[0])
+                        query = parse_qs(parsed.query)
+                        limit = int(query.get("limit", ["20"])[0])
+                        offset = int(query.get("offset", ["0"])[0])
                     except (TypeError, ValueError):
                         inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
                         return
+                    limit = min(100, max(1, limit))
+                    offset = max(0, offset)
                     inner_self._send_json(
                         200,
-                        {"ok": True, "messages": api_server.buffer.queue.list_active(limit)},
+                        {
+                            "ok": True,
+                            "messages": api_server.buffer.queue.list_active(limit, offset),
+                            "total": sum(
+                                api_server.buffer.queue.count_state(state)
+                                for state in ("staged", "pending", "inflight")
+                            ),
+                        },
                     )
                     return
                 if parsed.path != "/healthz":
@@ -682,18 +738,28 @@ class BridgeApiServer:
                     return
 
                 if inner_self.path == "/v1/messages/pull":
-                    try:
-                        max_items = int(payload.get("max_items", 50))
-                        wait_ms = int(payload.get("wait_ms", 15000))
-                    except (TypeError, ValueError):
+                    max_items_value = payload.get("max_items", 50)
+                    wait_ms_value = payload.get("wait_ms", 15000)
+                    if (
+                        isinstance(max_items_value, bool)
+                        or not isinstance(max_items_value, int)
+                        or isinstance(wait_ms_value, bool)
+                        or not isinstance(wait_ms_value, int)
+                    ):
                         inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
                         return
+                    max_items = max_items_value
+                    wait_ms = wait_ms_value
                     max_items = min(MAX_PULL_ITEMS, max(1, max_items))
                     wait_ms = min(60_000, max(0, wait_ms))
-                    ack_mode = bool(payload.get("ack_mode", False))
-                    consumer_id = str(
-                        payload.get("consumer_id") or "legacy-http"
-                    )[:128]
+                    ack_mode = payload.get("ack_mode", False)
+                    if not isinstance(ack_mode, bool):
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    consumer_id = payload.get("consumer_id", "legacy-http")
+                    if not _valid_identifier(consumer_id):
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
                     result = api_server.buffer.pull(
                         max_items=max_items,
                         wait_ms=wait_ms,
@@ -716,13 +782,18 @@ class BridgeApiServer:
 
                 if inner_self.path in ("/v1/messages/ack", "/v1/messages/nack"):
                     delivery_ids = payload.get("delivery_ids")
-                    if not isinstance(delivery_ids, list) or not all(
-                        isinstance(item, str) and item for item in delivery_ids
+                    if (
+                        not isinstance(delivery_ids, list)
+                        or not delivery_ids
+                        or len(delivery_ids) > MAX_DELIVERY_IDS
+                        or not all(
+                            _valid_identifier(item, 256) for item in delivery_ids
+                        )
                     ):
                         inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
                         return
-                    consumer_id = str(payload.get("consumer_id") or "")[:128]
-                    if not consumer_id:
+                    consumer_id = payload.get("consumer_id")
+                    if not _valid_identifier(consumer_id):
                         inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
                         return
                     if inner_self.path.endswith("/ack"):
@@ -758,6 +829,11 @@ class BridgeApiServer:
                     inner_self._send_json(200, {"ok": True, "result": result})
                     return
 
+                if inner_self.path == "/v1/messages/retry-all-active":
+                    retried = api_server.buffer.retry_all_active()
+                    inner_self._send_json(200, {"ok": True, "retried": retried})
+                    return
+
                 if inner_self.path == "/v1/messages/discard":
                     message_id = payload.get("message_id")
                     reason = payload.get("reason", "admin")
@@ -773,8 +849,15 @@ class BridgeApiServer:
                     return
 
                 if inner_self.path == "/v1/messages/requeue-all-dead":
-                    requeued = api_server.buffer.requeue_all_dead()
-                    inner_self._send_json(200, {"ok": True, "requeued": requeued})
+                    message_ids = api_server.buffer.requeue_all_dead_with_ids()
+                    inner_self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "requeued": len(message_ids),
+                            "message_ids": message_ids,
+                        },
+                    )
                     return
 
                 if inner_self.path == "/v1/messages/discard-all-dead":
@@ -782,7 +865,23 @@ class BridgeApiServer:
                     if not isinstance(reason, str):
                         inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
                         return
-                    discarded = api_server.buffer.discard_all_dead(reason)
+                    message_ids = api_server.buffer.discard_all_dead_with_ids(reason)
+                    inner_self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "discarded": len(message_ids),
+                            "message_ids": message_ids,
+                        },
+                    )
+                    return
+
+                if inner_self.path == "/v1/messages/discard-all-active":
+                    reason = payload.get("reason", "admin")
+                    if not isinstance(reason, str):
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    discarded = api_server.buffer.discard_all_active(reason)
                     inner_self._send_json(200, {"ok": True, "discarded": discarded})
                     return
 

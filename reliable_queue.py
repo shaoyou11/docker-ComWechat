@@ -117,8 +117,9 @@ class SQLiteMessageQueue:
 
     def _create_schema(self) -> None:
         with self._condition:
-            self._db.executescript(
-                """
+            with self._transaction():
+                self._db.execute(
+                    """
                 CREATE TABLE IF NOT EXISTS messages (
                     id TEXT PRIMARY KEY,
                     dedup_key TEXT NOT NULL UNIQUE,
@@ -141,34 +142,44 @@ class SQLiteMessageQueue:
                     discarded_at REAL,
                     discard_reason TEXT
                 );
-                CREATE INDEX IF NOT EXISTS idx_messages_delivery
-                    ON messages(state, available_at, sort_at, received_at);
-                CREATE INDEX IF NOT EXISTS idx_messages_lease
-                    ON messages(state, lease_until);
-                CREATE TABLE IF NOT EXISTS metrics (
-                    key TEXT PRIMARY KEY,
-                    value INTEGER NOT NULL DEFAULT 0
-                );
-                """
-            )
-            columns = {
-                row[1]
-                for row in self._db.execute("PRAGMA table_info(messages)").fetchall()
-            }
-            migrations = (
-                ("priority", "INTEGER NOT NULL DEFAULT 20"),
-                ("source_key", "TEXT NOT NULL DEFAULT 'unknown'"),
-                ("source_sequence", "INTEGER NOT NULL DEFAULT 0"),
-                ("discarded_at", "REAL"),
-                ("discard_reason", "TEXT"),
-            )
-            for name, definition in migrations:
-                if name not in columns:
-                    self._db.execute(f"ALTER TABLE messages ADD COLUMN {name} {definition}")
-            self._db.execute(
-                "CREATE INDEX IF NOT EXISTS idx_messages_priority "
-                "ON messages(state, priority, source_key, source_sequence, received_at)"
-            )
+                    """
+                )
+                self._db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_messages_delivery "
+                    "ON messages(state, available_at, sort_at, received_at)"
+                )
+                self._db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_messages_lease "
+                    "ON messages(state, lease_until)"
+                )
+                self._db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS metrics (
+                        key TEXT PRIMARY KEY,
+                        value INTEGER NOT NULL DEFAULT 0
+                    )
+                    """
+                )
+                columns = {
+                    row[1]
+                    for row in self._db.execute("PRAGMA table_info(messages)").fetchall()
+                }
+                migrations = (
+                    ("priority", "INTEGER NOT NULL DEFAULT 20"),
+                    ("source_key", "TEXT NOT NULL DEFAULT 'unknown'"),
+                    ("source_sequence", "INTEGER NOT NULL DEFAULT 0"),
+                    ("discarded_at", "REAL"),
+                    ("discard_reason", "TEXT"),
+                )
+                for name, definition in migrations:
+                    if name not in columns:
+                        self._db.execute(
+                            f"ALTER TABLE messages ADD COLUMN {name} {definition}"
+                        )
+                self._db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_messages_priority "
+                    "ON messages(state, priority, source_key, source_sequence, received_at)"
+                )
 
     def _transaction(self):
         return _Transaction(self._db)
@@ -596,7 +607,7 @@ class SQLiteMessageQueue:
                 self._condition.notify_all()
             return len(rows)
 
-    def list_dead(self, limit: int = 20) -> List[Dict[str, Any]]:
+    def list_dead(self, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
         now = self._now()
         with self._condition:
             with self._transaction():
@@ -607,13 +618,13 @@ class SQLiteMessageQueue:
                       FROM messages
                      WHERE state='dead'
                      ORDER BY dead_at DESC, received_at DESC
-                     LIMIT ?
+                     LIMIT ? OFFSET ?
                     """,
-                    (min(100, max(1, int(limit))),),
+                    (min(100, max(1, int(limit))), max(0, int(offset))),
                 ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_active(self, limit: int = 20) -> List[Dict[str, Any]]:
+    def list_active(self, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
         now = self._now()
         with self._condition:
             with self._transaction():
@@ -626,9 +637,9 @@ class SQLiteMessageQueue:
                       FROM messages
                      WHERE state IN ('staged', 'pending', 'inflight')
                      ORDER BY priority ASC, sort_at ASC, received_at ASC
-                     LIMIT ?
+                     LIMIT ? OFFSET ?
                     """,
-                    (min(100, max(1, int(limit))),),
+                    (min(100, max(1, int(limit))), max(0, int(offset))),
                 ).fetchall()
 
         records = []
@@ -668,6 +679,19 @@ class SQLiteMessageQueue:
             )
         return records
 
+    def count_state(self, state: str) -> int:
+        if state not in ("staged", "pending", "inflight", "dead", "discarded"):
+            raise ValueError("invalid queue state")
+        now = self._now()
+        with self._condition:
+            with self._transaction():
+                self._maintenance_locked(now)
+                row = self._db.execute(
+                    "SELECT COUNT(*) AS count FROM messages WHERE state=?",
+                    (state,),
+                ).fetchone()
+        return int(row["count"] if row else 0)
+
     def requeue_dead(self, message_id: str) -> bool:
         now = self._now()
         with self._condition:
@@ -702,9 +726,9 @@ class SQLiteMessageQueue:
                 self._condition.notify_all()
             return changed
 
-    def requeue_all_dead(self) -> int:
+    def requeue_all_dead_with_ids(self) -> List[str]:
         now = self._now()
-        requeued = 0
+        requeued_ids = []
         with self._condition:
             with self._transaction():
                 self._maintenance_locked(now)
@@ -735,12 +759,16 @@ class SQLiteMessageQueue:
                             row["id"],
                         ),
                     )
-                    requeued += cursor.rowcount
-                if requeued:
-                    self._increment_metric_locked("requeued_total", requeued)
-            if requeued:
+                    if cursor.rowcount:
+                        requeued_ids.append(str(row["id"]))
+                if requeued_ids:
+                    self._increment_metric_locked("requeued_total", len(requeued_ids))
+            if requeued_ids:
                 self._condition.notify_all()
-            return requeued
+            return requeued_ids
+
+    def requeue_all_dead(self) -> int:
+        return len(self.requeue_all_dead_with_ids())
 
     def retry_active(self, message_id: str) -> str:
         now = self._now()
@@ -755,7 +783,7 @@ class SQLiteMessageQueue:
                     return "not_found"
                 if row["state"] == "inflight":
                     return "inflight"
-                if row["state"] not in ("staged", "pending"):
+                if row["state"] != "pending":
                     return "not_found"
                 self._db.execute(
                     """
@@ -767,12 +795,40 @@ class SQLiteMessageQueue:
                            lease_owner=NULL,
                            lease_until=NULL,
                            last_error=NULL
-                     WHERE id=? AND state IN ('staged', 'pending')
+                     WHERE id=? AND state='pending'
                     """,
                     (now, self._next_release_sequence_locked(), str(message_id)),
                 )
             self._condition.notify_all()
             return "retried"
+
+    def retry_all_active(self) -> int:
+        now = self._now()
+        retried = 0
+        with self._condition:
+            with self._transaction():
+                self._maintenance_locked(now)
+                rows = self._db.execute(
+                    "SELECT id FROM messages WHERE state='pending' "
+                    "ORDER BY priority, source_key, source_sequence, sort_at, received_at, id"
+                ).fetchall()
+                for row in rows:
+                    cursor = self._db.execute(
+                        """
+                        UPDATE messages
+                           SET available_at=?,
+                               sort_at=?,
+                               last_error=NULL
+                         WHERE id=? AND state='pending'
+                        """,
+                        (now, self._next_release_sequence_locked(), row["id"]),
+                    )
+                    retried += cursor.rowcount
+                if retried:
+                    self._increment_metric_locked("requeued_total", retried)
+            if retried:
+                self._condition.notify_all()
+            return retried
 
     def discard_message(self, message_id: str, reason: str = "") -> str:
         now = self._now()
@@ -813,7 +869,44 @@ class SQLiteMessageQueue:
             self._condition.notify_all()
             return "discarded"
 
+    def discard_all_dead_with_ids(self, reason: str = "") -> List[str]:
+        now = self._now()
+        clean_reason = " ".join(str(reason).split())[:500]
+        with self._condition:
+            with self._transaction():
+                self._maintenance_locked(now)
+                rows = self._db.execute(
+                    "SELECT id FROM messages WHERE state='dead'"
+                ).fetchall()
+                message_ids = [str(row["id"]) for row in rows]
+                self._db.execute(
+                    """
+                    UPDATE messages
+                       SET state='discarded',
+                           payload='{}',
+                           discarded_at=?,
+                           discard_reason=?,
+                           lease_token=NULL,
+                           lease_owner=NULL,
+                           lease_until=NULL,
+                           acked_at=NULL,
+                           dead_at=NULL,
+                           last_error=NULL
+                     WHERE state='dead'
+                    """,
+                    (now, clean_reason),
+                )
+                discarded = len(message_ids)
+                if discarded:
+                    self._increment_metric_locked("discarded_total", discarded)
+            if discarded:
+                self._condition.notify_all()
+            return message_ids
+
     def discard_all_dead(self, reason: str = "") -> int:
+        return len(self.discard_all_dead_with_ids(reason))
+
+    def discard_all_active(self, reason: str = "") -> int:
         now = self._now()
         clean_reason = " ".join(str(reason).split())[:500]
         with self._condition:
@@ -832,7 +925,7 @@ class SQLiteMessageQueue:
                            acked_at=NULL,
                            dead_at=NULL,
                            last_error=NULL
-                     WHERE state='dead'
+                     WHERE state IN ('staged', 'pending')
                     """,
                     (now, clean_reason),
                 )

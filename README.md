@@ -45,7 +45,16 @@ volumes:
 - `POST /v1/messages/pull`
 - `POST /v1/messages/ack`
 - `POST /v1/messages/nack`
+- `GET /v1/messages/active?limit=5&offset=0`
+- `GET /v1/messages/dead?limit=5&offset=0`
+- `POST /v1/messages/retry-active`
+- `POST /v1/messages/retry-all-active`
+- `POST /v1/messages/requeue`、`/v1/messages/requeue-all-dead`
+- `POST /v1/messages/discard`、`/v1/messages/discard-all-active`、`/v1/messages/discard-all-dead`
 - SQLite WAL 持久化、租约、去重、过期死信、登录阶段排序和队列指标
+
+Bridge 管理 API 只绑定共享容器网络命名空间内的回环地址，不作为新的局域网或公网入口；
+活动队列中的 `staged` 和 `inflight` 状态不会被批量操作强行改动。
 
 新消费端在拉取请求中发送 `ack_mode: true`。消息在 ACK 前保持为租约状态；
 消费失败可 NACK 并延迟重试。旧消费端不发送 `ack_mode` 时仍保持拉取即确认的

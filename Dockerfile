@@ -14,7 +14,7 @@ ENV COMWECHAT_VERSION=3.9.12.16 \
     COMWECHAT_BRIDGE_ENABLED=false \
     COMWECHAT_BRIDGE_IN_HOST=0.0.0.0 \
     COMWECHAT_BRIDGE_IN_PORT=23456 \
-    COMWECHAT_BRIDGE_API_HOST=0.0.0.0 \
+    COMWECHAT_BRIDGE_API_HOST=127.0.0.1 \
     COMWECHAT_BRIDGE_API_PORT=19088 \
     COMWECHAT_API_PORT=18888 \
     COMWECHAT_BRIDGE_DB_PATH=/var/lib/comwechat-bridge/queue.db \
@@ -33,7 +33,7 @@ RUN mkdir -p /var/lib/comwechat-bridge && \
     python3 -m py_compile /run.py /comwechat_bridge.py /reliable_queue.py /healthcheck.py && \
     chmod 0755 /run.py /healthcheck.py
 
-EXPOSE 5905 19088
+EXPOSE 5905
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
     CMD ["python3", "/healthcheck.py"]
