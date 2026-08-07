@@ -164,6 +164,57 @@ class ReliableQueueTests(unittest.TestCase):
         self.assertEqual(retried["deliveries"][0]["attempts"], 1)
         queue.close()
 
+    def test_retry_active_releases_pending_message_immediately(self):
+        queue = self.queue()
+        message_id, _, _ = queue.stage(self.message("active-retry"))
+
+        self.assertEqual(queue.retry_active(message_id), "retried")
+        result = queue.pull(1, 0, True, "efb")
+
+        self.assertEqual(result["messages"][0]["msgid"], "active-retry")
+        queue.close()
+
+    def test_retry_active_rejects_inflight_message(self):
+        queue = self.queue()
+        message_id, _, _ = queue.stage(self.message("active-inflight"))
+        queue.release([message_id])
+        queue.pull(1, 0, True, "efb")
+
+        self.assertEqual(queue.retry_active(message_id), "inflight")
+        queue.close()
+
+    def test_discard_dead_removes_dead_count_but_keeps_deduplication(self):
+        queue = self.queue(max_attempts=1, retry_delay_seconds=0)
+        message = self.message("dead-discard")
+        message_id, dedup_key, _ = queue.stage(message)
+        queue.release([message_id])
+        delivery = queue.pull(1, 0, True, "efb")["deliveries"][0]
+        queue.nack([delivery["delivery_id"]], "efb", "test failure")
+
+        self.assertEqual(queue.discard_message(message_id, "admin"), "discarded")
+        self.assertEqual(queue.snapshot()["dead_letter_size"], 0)
+        self.assertEqual(queue.snapshot()["discarded_size"], 1)
+        repeated_id, repeated_key, inserted = queue.stage(message)
+        self.assertEqual(repeated_id, message_id)
+        self.assertEqual(repeated_key, dedup_key)
+        self.assertFalse(inserted)
+        queue.close()
+
+    def test_discard_batch_only_changes_dead_messages(self):
+        queue = self.queue(max_attempts=1, retry_delay_seconds=0)
+        for msgid in ("dead-a", "dead-b"):
+            message_id, _, _ = queue.stage(self.message(msgid))
+            queue.release([message_id])
+            delivery = queue.pull(1, 0, True, "efb")["deliveries"][0]
+            queue.nack([delivery["delivery_id"]], "efb", "test failure")
+        active_id, _, _ = queue.stage(self.message("still-active"))
+
+        self.assertEqual(queue.discard_all_dead("admin"), 2)
+        self.assertEqual(queue.snapshot()["dead_letter_size"], 0)
+        self.assertEqual(queue.snapshot()["pending_size"], 0)
+        self.assertEqual(queue.discard_message(active_id, "admin"), "discarded")
+        queue.close()
+
     def test_successful_ack_clears_previous_error(self):
         queue = self.queue(retry_delay_seconds=0)
         queue.stage(self.message("eventual-success"))

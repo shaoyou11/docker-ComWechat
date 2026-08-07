@@ -137,7 +137,9 @@ class SQLiteMessageQueue:
                     expires_at REAL NOT NULL,
                     acked_at REAL,
                     dead_at REAL,
-                    last_error TEXT
+                    last_error TEXT,
+                    discarded_at REAL,
+                    discard_reason TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_delivery
                     ON messages(state, available_at, sort_at, received_at);
@@ -157,6 +159,8 @@ class SQLiteMessageQueue:
                 ("priority", "INTEGER NOT NULL DEFAULT 20"),
                 ("source_key", "TEXT NOT NULL DEFAULT 'unknown'"),
                 ("source_sequence", "INTEGER NOT NULL DEFAULT 0"),
+                ("discarded_at", "REAL"),
+                ("discard_reason", "TEXT"),
             )
             for name, definition in migrations:
                 if name not in columns:
@@ -237,6 +241,10 @@ class SQLiteMessageQueue:
         )
         self._db.execute(
             "DELETE FROM messages WHERE state='dead' AND dead_at <= ?",
+            (now - self.config.dead_retention_seconds,),
+        )
+        self._db.execute(
+            "DELETE FROM messages WHERE state='discarded' AND discarded_at <= ?",
             (now - self.config.dead_retention_seconds,),
         )
 
@@ -694,6 +702,147 @@ class SQLiteMessageQueue:
                 self._condition.notify_all()
             return changed
 
+    def requeue_all_dead(self) -> int:
+        now = self._now()
+        requeued = 0
+        with self._condition:
+            with self._transaction():
+                self._maintenance_locked(now)
+                rows = self._db.execute(
+                    "SELECT id FROM messages WHERE state='dead' ORDER BY dead_at, received_at, id"
+                ).fetchall()
+                for row in rows:
+                    cursor = self._db.execute(
+                        """
+                        UPDATE messages
+                           SET state='pending',
+                               available_at=?,
+                               sort_at=?,
+                               attempts=0,
+                               expires_at=?,
+                               lease_token=NULL,
+                               lease_owner=NULL,
+                               lease_until=NULL,
+                               acked_at=NULL,
+                               dead_at=NULL,
+                               last_error=NULL
+                         WHERE id=? AND state='dead'
+                        """,
+                        (
+                            now,
+                            self._next_release_sequence_locked(),
+                            now + self.config.message_ttl_seconds,
+                            row["id"],
+                        ),
+                    )
+                    requeued += cursor.rowcount
+                if requeued:
+                    self._increment_metric_locked("requeued_total", requeued)
+            if requeued:
+                self._condition.notify_all()
+            return requeued
+
+    def retry_active(self, message_id: str) -> str:
+        now = self._now()
+        with self._condition:
+            with self._transaction():
+                self._maintenance_locked(now)
+                row = self._db.execute(
+                    "SELECT state FROM messages WHERE id=?",
+                    (str(message_id),),
+                ).fetchone()
+                if row is None:
+                    return "not_found"
+                if row["state"] == "inflight":
+                    return "inflight"
+                if row["state"] not in ("staged", "pending"):
+                    return "not_found"
+                self._db.execute(
+                    """
+                    UPDATE messages
+                       SET state='pending',
+                           available_at=?,
+                           sort_at=?,
+                           lease_token=NULL,
+                           lease_owner=NULL,
+                           lease_until=NULL,
+                           last_error=NULL
+                     WHERE id=? AND state IN ('staged', 'pending')
+                    """,
+                    (now, self._next_release_sequence_locked(), str(message_id)),
+                )
+            self._condition.notify_all()
+            return "retried"
+
+    def discard_message(self, message_id: str, reason: str = "") -> str:
+        now = self._now()
+        clean_reason = " ".join(str(reason).split())[:500]
+        with self._condition:
+            with self._transaction():
+                self._maintenance_locked(now)
+                row = self._db.execute(
+                    "SELECT state FROM messages WHERE id=?",
+                    (str(message_id),),
+                ).fetchone()
+                if row is None:
+                    return "not_found"
+                if row["state"] == "inflight":
+                    return "inflight"
+                if row["state"] not in ("staged", "pending", "dead"):
+                    return "not_found"
+                cursor = self._db.execute(
+                    """
+                    UPDATE messages
+                       SET state='discarded',
+                           payload='{}',
+                           discarded_at=?,
+                           discard_reason=?,
+                           lease_token=NULL,
+                           lease_owner=NULL,
+                           lease_until=NULL,
+                           acked_at=NULL,
+                           dead_at=NULL,
+                           last_error=NULL
+                     WHERE id=? AND state IN ('staged', 'pending', 'dead')
+                    """,
+                    (now, clean_reason, str(message_id)),
+                )
+                if cursor.rowcount != 1:
+                    return "not_found"
+                self._increment_metric_locked("discarded_total")
+            self._condition.notify_all()
+            return "discarded"
+
+    def discard_all_dead(self, reason: str = "") -> int:
+        now = self._now()
+        clean_reason = " ".join(str(reason).split())[:500]
+        with self._condition:
+            with self._transaction():
+                self._maintenance_locked(now)
+                cursor = self._db.execute(
+                    """
+                    UPDATE messages
+                       SET state='discarded',
+                           payload='{}',
+                           discarded_at=?,
+                           discard_reason=?,
+                           lease_token=NULL,
+                           lease_owner=NULL,
+                           lease_until=NULL,
+                           acked_at=NULL,
+                           dead_at=NULL,
+                           last_error=NULL
+                     WHERE state='dead'
+                    """,
+                    (now, clean_reason),
+                )
+                discarded = cursor.rowcount
+                if discarded:
+                    self._increment_metric_locked("discarded_total", discarded)
+            if discarded:
+                self._condition.notify_all()
+            return discarded
+
     def _state_counts_locked(self) -> Dict[str, int]:
         return {
             row["state"]: int(row["count"])
@@ -728,6 +877,7 @@ class SQLiteMessageQueue:
                 "inflight_size": counts.get("inflight", 0),
                 "acked_size": counts.get("acked", 0),
                 "dead_letter_size": counts.get("dead", 0),
+                "discarded_size": counts.get("discarded", 0),
                 "queue_size": sum(counts.get(state, 0) for state in ACTIVE_STATES),
                 "acked_total": metrics.get("acked_total", 0),
                 "deduplicated_total": metrics.get("deduplicated_total", 0),
