@@ -195,6 +195,35 @@ class DockerWechatHookTests(unittest.TestCase):
             with self.assertRaises(run.WechatStackStartupFailed):
                 hook.change_version(attempts=2, retry_seconds=0)
 
+    @mock.patch("run.signal.signal")
+    def test_version_change_is_skipped_when_switch_is_disabled(self, _signal):
+        hook = run.DockerWechatHook()
+        with mock.patch.object(run, "VERSION_CHANGE_ENABLED", False):
+            with mock.patch.object(hook, "change_version") as change_version:
+                hook.maybe_change_version()
+
+        change_version.assert_not_called()
+
+    @mock.patch("run.signal.signal")
+    def test_version_change_runs_when_switch_is_enabled(self, _signal):
+        hook = run.DockerWechatHook()
+        with mock.patch.object(run, "VERSION_CHANGE_ENABLED", True):
+            with mock.patch.object(hook, "change_version") as change_version:
+                hook.maybe_change_version()
+
+        change_version.assert_called_once_with()
+
+    @mock.patch("run.signal.signal")
+    def test_version_change_failure_does_not_abort_stack_when_enabled(self, _signal):
+        hook = run.DockerWechatHook()
+        with mock.patch.object(run, "VERSION_CHANGE_ENABLED", True):
+            with mock.patch.object(
+                hook,
+                "change_version",
+                side_effect=run.WechatStackStartupFailed("not ready"),
+            ):
+                hook.maybe_change_version()
+
     @mock.patch("run.time.sleep")
     @mock.patch("run.time.monotonic", return_value=1000)
     @mock.patch("run.signal.signal")

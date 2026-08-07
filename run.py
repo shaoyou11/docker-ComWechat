@@ -19,6 +19,9 @@ VERSION_CHANGE_CONNECT_TIMEOUT_SECONDS = int(
 VERSION_CHANGE_MAX_TIME_SECONDS = int(
     os.environ.get("COMWECHAT_VERSION_CHANGE_MAX_TIME_SECONDS", "10")
 )
+VERSION_CHANGE_ENABLED = os.environ.get(
+    "COMWECHAT_VERSION_CHANGE_ENABLED", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 CHILD_RECOVERY_ATTEMPTS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_ATTEMPTS", "3"))
 CHILD_RECOVERY_BACKOFF_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_BACKOFF_SECONDS", "5"))
 CHILD_RECOVERY_RESET_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_RESET_SECONDS", "300"))
@@ -159,6 +162,15 @@ class DockerWechatHook:
         )
         raise WechatStackStartupFailed("版本修改接口连续失败")
 
+    def maybe_change_version(self):
+        if not VERSION_CHANGE_ENABLED:
+            print("版本修改已关闭，跳过版本修改。", flush=True)
+            return
+        try:
+            self.change_version()
+        except WechatStackStartupFailed as error:
+            print(f"版本修改失败，继续启动微信栈: {error}", flush=True)
+
     def start_bridge(self):
         config = BridgeConfig.from_env()
         if not config.enabled:
@@ -269,7 +281,7 @@ class DockerWechatHook:
                 try:
                     self.run_wechat()
                     self.run_hook()
-                    self.change_version()
+                    self.maybe_change_version()
                     self.start_bridge()
                     self.monitor_children()
                 except (ChildProcessStopped, WechatStackStartupFailed) as error:

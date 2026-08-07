@@ -21,6 +21,7 @@ Bridge 默认关闭，关闭时行为与现有 TCP 消息接收方式一致。
 ```yaml
 environment:
   COMWECHAT_VERSION: "3.9.12.16"
+  COMWECHAT_VERSION_CHANGE_ENABLED: "false"
   COMWECHAT_VERSION_CHANGE_ATTEMPTS: "20"
   COMWECHAT_VERSION_CHANGE_RETRY_SECONDS: "2"
   COMWECHAT_CHILD_RECOVERY_ATTEMPTS: "3"
@@ -62,6 +63,10 @@ Bridge 管理 API 只绑定共享容器网络命名空间内的回环地址，�
 
 Bridge 只负责消息 Hook 与拉取接口，不点击微信界面，也不自动重启微信。
 微信或 Hook 子进程意外退出时，会优先在当前容器内有限恢复，避免共享网络命名空间被重建。连续失败超过上限后停止自动尝试并保留 VNC，等待人工或定时重启；登录界面恢复仍由独立 Watchdog 控制。
+
+## 版本修改开关
+
+`COMWECHAT_VERSION_CHANGE_ENABLED` 默认是 `false`。关闭时，容器启动不会调用版本修改接口；开启为 `true` 后才会执行版本修改。版本修改接口偶发不可用时只记录警告并继续启动微信栈，不再因为这一步直接触发容器内恢复。
 
 ## 私有运行文件
 
