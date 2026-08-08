@@ -177,7 +177,18 @@ class DockerWechatHook:
             print("Bridge API 未启用，继续使用原有 TCP 消息方式。", flush=True)
             return
         self.bridge = BridgeService(config)
-        self.bridge.start()
+        try:
+            self.bridge.start()
+        except Exception as error:
+            # A slow WeChat/Hook API must use the existing in-container
+            # recovery path instead of terminating the Docker main process.
+            bridge = self.bridge
+            self.bridge = None
+            try:
+                bridge.stop()
+            except Exception as stop_error:
+                print(f"Bridge 启动失败后的清理失败: {stop_error}", flush=True)
+            raise WechatStackStartupFailed(f"Bridge 启动失败: {error}") from error
 
     def monitor_children(self, poll_interval=1):
         while not self.exiting:

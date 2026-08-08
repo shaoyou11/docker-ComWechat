@@ -58,6 +58,22 @@ class DockerWechatHookTests(unittest.TestCase):
         service.start.assert_called_once_with()
         self.assertIs(hook.bridge, service)
 
+    @mock.patch("run.signal.signal")
+    def test_bridge_start_failure_uses_internal_recovery(self, _signal):
+        hook = run.DockerWechatHook()
+        config = mock.Mock(enabled=True)
+        service = mock.Mock()
+        service.start.side_effect = RuntimeError("API not ready")
+        with mock.patch("run.BridgeConfig.from_env", return_value=config):
+            with mock.patch("run.BridgeService", return_value=service):
+                with self.assertRaisesRegex(
+                    run.WechatStackStartupFailed, "Bridge 启动失败"
+                ):
+                    hook.start_bridge()
+
+        service.stop.assert_called_once_with()
+        self.assertIsNone(hook.bridge)
+
     @mock.patch("run.time.sleep")
     @mock.patch("run.subprocess.Popen")
     @mock.patch("run.subprocess.run")
