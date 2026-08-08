@@ -26,7 +26,7 @@ environment:
   COMWECHAT_VERSION_CHANGE_RETRY_SECONDS: "2"
   COMWECHAT_CHILD_RECOVERY_ATTEMPTS: "3"
   COMWECHAT_CHILD_RECOVERY_BACKOFF_SECONDS: "5"
-  COMWECHAT_CHILD_RECOVERY_RESET_SECONDS: "300"
+  COMWECHAT_CHILD_RECOVERY_RESET_SECONDS: "0"
   COMWECHAT_BRIDGE_ENABLED: "true"
   COMWECHAT_BRIDGE_IN_PORT: "23456"
   COMWECHAT_BRIDGE_API_PORT: "19088"
@@ -62,7 +62,9 @@ Bridge 管理 API 只绑定共享容器网络命名空间内的回环地址，�
 兼容行为。
 
 Bridge 只负责消息 Hook 与拉取接口，不点击微信界面，也不自动重启微信。
-微信或 Hook 子进程意外退出时，会优先在当前容器内有限恢复，避免共享网络命名空间被重建。连续失败超过上限后停止自动尝试并保留 VNC，等待人工或定时重启；登录界面恢复仍由独立 Watchdog 控制。
+微信或 Hook 子进程意外退出时，会优先在当前容器内有限恢复，避免共享网络命名空间被重建。
+连续失败超过上限后停止自动尝试并保留 VNC，默认不会自动重置失败计数；只有显式设置正数
+`COMWECHAT_CHILD_RECOVERY_RESET_SECONDS` 时才会按周期重新计数。登录界面恢复仍由独立 Watchdog 控制。
 
 ## 版本修改开关
 

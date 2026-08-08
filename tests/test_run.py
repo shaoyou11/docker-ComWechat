@@ -18,6 +18,14 @@ class FakeProcess:
 
 
 class DockerWechatHookTests(unittest.TestCase):
+    @mock.patch("run.CHILD_RECOVERY_RESET_SECONDS", 0)
+    def test_recovery_failure_budget_does_not_reset_by_default(self):
+        self.assertFalse(run.recovery_failures_should_reset(1000, 1))
+
+    @mock.patch("run.CHILD_RECOVERY_RESET_SECONDS", 300)
+    def test_recovery_failure_budget_can_use_explicit_reset_window(self):
+        self.assertTrue(run.recovery_failures_should_reset(1301, 1))
+
     @mock.patch("run.signal.signal")
     def test_prepare_copies_hook_and_keeps_source(self, _signal):
         hook = run.DockerWechatHook()
