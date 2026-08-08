@@ -15,7 +15,7 @@ VERSION_CHANGE_ATTEMPTS = int(os.environ.get("COMWECHAT_VERSION_CHANGE_ATTEMPTS"
 VERSION_CHANGE_RETRY_SECONDS = int(os.environ.get("COMWECHAT_VERSION_CHANGE_RETRY_SECONDS", "2"))
 CHILD_RECOVERY_ATTEMPTS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_ATTEMPTS", "3"))
 CHILD_RECOVERY_BACKOFF_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_BACKOFF_SECONDS", "5"))
-CHILD_RECOVERY_RESET_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_RESET_SECONDS", "300"))
+CHILD_RECOVERY_RESET_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_RESET_SECONDS", "0"))
 
 
 class ChildProcessStopped(RuntimeError):
@@ -27,6 +27,14 @@ class ChildProcessStopped(RuntimeError):
 
 class WechatStackStartupFailed(RuntimeError):
     pass
+
+
+def recovery_failures_should_reset(now, last_failure):
+    """Only reset the failure budget when an explicit positive window is set."""
+    return (
+        CHILD_RECOVERY_RESET_SECONDS > 0
+        and now - last_failure >= CHILD_RECOVERY_RESET_SECONDS
+    )
 
 
 class DockerWechatHook:
@@ -221,7 +229,7 @@ class DockerWechatHook:
                     self.monitor_children()
                 except (ChildProcessStopped, WechatStackStartupFailed) as error:
                     now = time.monotonic()
-                    if now - last_failure >= CHILD_RECOVERY_RESET_SECONDS:
+                    if recovery_failures_should_reset(now, last_failure):
                         recovery_failures = 0
                     recovery_failures += 1
                     last_failure = now
