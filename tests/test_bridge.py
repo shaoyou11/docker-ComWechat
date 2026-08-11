@@ -10,6 +10,7 @@ from urllib import request
 from comwechat_bridge import (
     BridgeApiServer,
     BridgeConfig,
+    BridgeService,
     MessageBuffer,
     is_fast_path,
     is_login_reorder_anchor,
@@ -174,6 +175,7 @@ class BridgeApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["hooks_ready"])
+        self.assertIn("stack_generation", payload)
 
     def test_active_endpoint_lists_message_summary(self):
         self.buffer.ingest({
@@ -273,6 +275,16 @@ class BridgeApiTests(unittest.TestCase):
         self.assertEqual(payload["queue_size"], 1)
         self.assertEqual(payload["dead_letter_size"], 0)
         self.assertIn("deduplicated_total", payload)
+
+    def test_bridge_service_assigns_stable_stack_generation(self):
+        service = BridgeService(self.config)
+        try:
+            generation = service.state["stack_generation"]
+
+            self.assertEqual(len(generation), 32)
+            self.assertEqual(service.state["stack_generation"], generation)
+        finally:
+            service.buffer.close()
 
     def test_dead_letter_endpoint_supports_manual_requeue(self):
         self.buffer.close()
