@@ -26,6 +26,18 @@ class DockerWechatHookTests(unittest.TestCase):
     def test_recovery_failure_budget_can_use_explicit_reset_window(self):
         self.assertTrue(run.recovery_failures_should_reset(1301, 1))
 
+    def test_stable_stack_run_resets_old_recovery_failures(self):
+        self.assertEqual(
+            run.recovery_failures_after_stable_run(3, 300, 300),
+            0,
+        )
+
+    def test_short_stack_run_keeps_recovery_failures(self):
+        self.assertEqual(
+            run.recovery_failures_after_stable_run(2, 299, 300),
+            2,
+        )
+
     @mock.patch("run.signal.signal")
     def test_prepare_copies_hook_and_keeps_source(self, _signal):
         hook = run.DockerWechatHook()
