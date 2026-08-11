@@ -1,6 +1,17 @@
 name: Test and publish GHCR image
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/docker_build.yml"
+      - "Dockerfile"
+      - "VERSION"
+      - "run.py"
+      - "comwechat_bridge.py"
+      - "healthcheck.py"
+      - "tests/**"
   push:
     branches:
       - main
@@ -16,7 +27,6 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: docker-comwechat-${{ github.ref }}
@@ -36,8 +46,12 @@ jobs:
           python -m unittest discover -s tests -v
 
   publish:
+    if: github.event_name != 'pull_request'
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -63,5 +77,23 @@ jobs:
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  canary:
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build canary without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          tags: ghcr.io/shaoyou11/docker-comwechat:canary
           cache-from: type=gha
           cache-to: type=gha,mode=max
