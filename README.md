@@ -32,6 +32,8 @@ environment:
   COMWECHAT_CHILD_RECOVERY_BACKOFF_SECONDS: "5"
   COMWECHAT_CHILD_RECOVERY_RESET_SECONDS: "0"
   COMWECHAT_CHILD_RECOVERY_STABLE_SECONDS: "300"
+  COMWECHAT_CHILD_UNRESPONSIVE_SECONDS: "30"
+  COMWECHAT_WINE_CLEANUP_TIMEOUT_SECONDS: "15"
   COMWECHAT_BRIDGE_ENABLED: "true"
   COMWECHAT_BRIDGE_IN_PORT: "23456"
   COMWECHAT_BRIDGE_API_PORT: "19088"
@@ -86,6 +88,8 @@ Bridge 管理 API 只绑定共享容器网络命名空间内的回环地址，�
 `COMWECHAT_CHILD_RECOVERY_RESET_SECONDS` 时才会按周期重新计数。
 
 微信栈连续稳定运行达到 `COMWECHAT_CHILD_RECOVERY_STABLE_SECONDS` 后，会清除此前遗留的失败计数。默认值为 300 秒；短时间连续崩溃仍受原恢复上限约束，不会无限重启。
+
+恢复前会终止整代 Wine 会话，并检查微信、Hook、桌面和 Wine 后台进程是否残留。若进程处于不可中断状态或无法清理，当前恢复会停止，不会在旧窗口上叠加启动新的微信实例。健康检查也会拒绝卡死进程和重复 Wine 桌面代次。
 
 登录界面恢复由独立的 `efb-watchdog` 负责，Bridge 不会点击“确定”或“进入微信”，也不会绕过微信服务端验证。
 
