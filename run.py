@@ -28,6 +28,24 @@ CHILD_RECOVERY_RESET_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_RESE
 CHILD_RECOVERY_STABLE_SECONDS = int(
     os.environ.get("COMWECHAT_CHILD_RECOVERY_STABLE_SECONDS", "300")
 )
+WINE_CLEANUP_TIMEOUT_SECONDS = int(
+    os.environ.get("COMWECHAT_WINE_CLEANUP_TIMEOUT_SECONDS", "15")
+)
+CHILD_UNRESPONSIVE_SECONDS = int(
+    os.environ.get("COMWECHAT_CHILD_UNRESPONSIVE_SECONDS", "30")
+)
+WINE_PROCESS_NAMES = {
+    "WeChat.exe",
+    "WeChatHook.exe",
+    "explorer.exe",
+    "plugplay.exe",
+    "rpcss.exe",
+    "services.exe",
+    "svchost.exe",
+    "wineboot.exe",
+    "winedevice.exe",
+    "wineserver",
+}
 
 
 class ChildProcessStopped(RuntimeError):
@@ -38,6 +56,10 @@ class ChildProcessStopped(RuntimeError):
 
 
 class WechatStackStartupFailed(RuntimeError):
+    pass
+
+
+class WineSessionCleanupFailed(RuntimeError):
     pass
 
 
@@ -208,6 +230,7 @@ class DockerWechatHook:
             raise WechatStackStartupFailed(f"Bridge 启动失败: {error}") from error
 
     def monitor_children(self, poll_interval=1):
+        unresponsive_since = {}
         while not self.exiting:
             for name, process in (
                 ("WeChat", self.wechat),
@@ -218,6 +241,13 @@ class DockerWechatHook:
                 status = process.poll()
                 if status is not None:
                     raise ChildProcessStopped(name, status)
+                state = self._process_state(getattr(process, "pid", None))
+                if state == "D":
+                    started = unresponsive_since.setdefault(name, time.monotonic())
+                    if time.monotonic() - started >= CHILD_UNRESPONSIVE_SECONDS:
+                        raise ChildProcessStopped(name, "uninterruptible")
+                else:
+                    unresponsive_since.pop(name, None)
             time.sleep(poll_interval)
 
     def stop_wechat_stack(self):
@@ -231,6 +261,81 @@ class DockerWechatHook:
         self._terminate("微信", self.wechat)
         self.reg_hook = None
         self.wechat = None
+        if not self.cleanup_wine_session():
+            raise WineSessionCleanupFailed(
+                "旧 Wine 会话仍有不可终止进程，已禁止叠加启动新微信"
+            )
+
+    @staticmethod
+    def _process_state(pid):
+        if not pid:
+            return None
+        try:
+            stat = open(f"/proc/{pid}/stat", encoding="utf-8").read()
+        except (OSError, ValueError):
+            return None
+        end = stat.rfind(")")
+        return stat[end + 2 : end + 3] if end >= 0 else None
+
+    @classmethod
+    def _wine_processes(cls):
+        processes = []
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return processes
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/comm", encoding="utf-8") as source:
+                    name = source.read().strip()
+            except OSError:
+                continue
+            if name not in WINE_PROCESS_NAMES:
+                continue
+            state = cls._process_state(pid)
+            if state != "Z":
+                processes.append((pid, name, state))
+        return processes
+
+    @classmethod
+    def cleanup_wine_session(cls, timeout=WINE_CLEANUP_TIMEOUT_SECONDS):
+        """Stop the whole Wine generation before another WeChat is launched."""
+        try:
+            subprocess.run(
+                ["wineserver", "-k"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=min(5, max(1, timeout)),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+        deadline = time.monotonic() + max(1, timeout)
+        while time.monotonic() < deadline:
+            remaining = cls._wine_processes()
+            if not remaining:
+                return True
+            time.sleep(0.5)
+
+        remaining = cls._wine_processes()
+        for pid, _name, _state in remaining:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+        time.sleep(1)
+        remaining = cls._wine_processes()
+        if remaining:
+            details = ", ".join(
+                f"{name}[{pid}]({state or '?'})" for pid, name, state in remaining
+            )
+            print(f"Wine 会话清理失败，残留进程: {details}", flush=True)
+            return False
+        return True
 
     def wait_for_manual_restart(self):
         print(
@@ -289,8 +394,12 @@ class DockerWechatHook:
             + " 正在退出容器...",
             flush=True,
         )
-        self.stop_wechat_stack()
-        self._terminate("VNC", self.vnc)
+        try:
+            self.stop_wechat_stack()
+        except WineSessionCleanupFailed as error:
+            print(f"容器退出时 Wine 会话未完全结束: {error}", flush=True)
+        finally:
+            self._terminate("VNC", self.vnc)
         if exit_code:
             raise SystemExit(exit_code)
 
@@ -333,7 +442,12 @@ class DockerWechatHook:
                     recovery_failures += 1
                     last_failure = now
                     print(f"微信栈需要恢复: {error}", flush=True)
-                    self.stop_wechat_stack()
+                    try:
+                        self.stop_wechat_stack()
+                    except WineSessionCleanupFailed as cleanup_error:
+                        print(f"微信栈恢复已停止: {cleanup_error}", flush=True)
+                        self.wait_for_manual_restart()
+                        return
                     if recovery_failures > CHILD_RECOVERY_ATTEMPTS:
                         self.wait_for_manual_restart()
                         return

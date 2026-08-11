@@ -145,6 +145,33 @@ class DockerWechatHookTests(unittest.TestCase):
         self.assertEqual(process.wait.call_args_list, [mock.call(timeout=10), mock.call(timeout=5)])
 
     @mock.patch("run.signal.signal")
+    def test_stop_stack_cleans_entire_wine_generation(self, _signal):
+        hook = run.DockerWechatHook()
+        with mock.patch.object(hook, "cleanup_wine_session", return_value=True) as cleanup:
+            hook.stop_wechat_stack()
+        cleanup.assert_called_once_with()
+
+    @mock.patch("run.time.sleep")
+    @mock.patch("run.time.monotonic", side_effect=[0, 1, 2, 3])
+    @mock.patch("run.signal.signal")
+    def test_cleanup_refuses_to_leave_stale_wine_generation(
+        self, _signal, _monotonic, _sleep
+    ):
+        hook = run.DockerWechatHook()
+        stale = [(88, "wineboot.exe", "D")]
+        with mock.patch.object(run.DockerWechatHook, "_wine_processes", return_value=stale), \
+                mock.patch("run.subprocess.run"), \
+                mock.patch("run.os.kill"):
+            self.assertFalse(hook.cleanup_wine_session(timeout=1))
+
+    @mock.patch("run.signal.signal")
+    def test_stop_stack_blocks_new_generation_when_cleanup_fails(self, _signal):
+        hook = run.DockerWechatHook()
+        with mock.patch.object(hook, "cleanup_wine_session", return_value=False):
+            with self.assertRaises(run.WineSessionCleanupFailed):
+                hook.stop_wechat_stack()
+
+    @mock.patch("run.signal.signal")
     def test_shutdown_is_idempotent(self, _signal):
         hook = run.DockerWechatHook()
         hook.vnc = FakeProcess()
