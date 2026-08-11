@@ -25,6 +25,9 @@ VERSION_CHANGE_ENABLED = os.environ.get(
 CHILD_RECOVERY_ATTEMPTS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_ATTEMPTS", "3"))
 CHILD_RECOVERY_BACKOFF_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_BACKOFF_SECONDS", "5"))
 CHILD_RECOVERY_RESET_SECONDS = int(os.environ.get("COMWECHAT_CHILD_RECOVERY_RESET_SECONDS", "0"))
+CHILD_RECOVERY_STABLE_SECONDS = int(
+    os.environ.get("COMWECHAT_CHILD_RECOVERY_STABLE_SECONDS", "300")
+)
 
 
 class ChildProcessStopped(RuntimeError):
@@ -44,6 +47,12 @@ def recovery_failures_should_reset(now, last_failure):
         CHILD_RECOVERY_RESET_SECONDS > 0
         and now - last_failure >= CHILD_RECOVERY_RESET_SECONDS
     )
+
+
+def recovery_failures_after_stable_run(failures, run_seconds, stable_seconds):
+    if stable_seconds > 0 and run_seconds >= stable_seconds:
+        return 0
+    return failures
 
 
 class DockerWechatHook:
@@ -297,16 +306,30 @@ class DockerWechatHook:
             recovery_failures = 0
             last_failure = 0.0
             while not self.exiting:
+                stack_ready_at = None
                 try:
                     self.run_wechat()
                     self.run_hook()
                     self.maybe_change_version()
                     self.start_bridge()
+                    stack_ready_at = time.monotonic()
                     self.monitor_children()
                 except (ChildProcessStopped, WechatStackStartupFailed) as error:
                     now = time.monotonic()
                     if recovery_failures_should_reset(now, last_failure):
                         recovery_failures = 0
+                    if stack_ready_at is not None:
+                        previous_failures = recovery_failures
+                        recovery_failures = recovery_failures_after_stable_run(
+                            recovery_failures,
+                            run_seconds=now - stack_ready_at,
+                            stable_seconds=CHILD_RECOVERY_STABLE_SECONDS,
+                        )
+                        if previous_failures and not recovery_failures:
+                            print(
+                                "微信栈已稳定运行，旧的恢复失败计数已清零。",
+                                flush=True,
+                            )
                     recovery_failures += 1
                     last_failure = now
                     print(f"微信栈需要恢复: {error}", flush=True)

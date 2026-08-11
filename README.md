@@ -31,6 +31,7 @@ environment:
   COMWECHAT_CHILD_RECOVERY_ATTEMPTS: "3"
   COMWECHAT_CHILD_RECOVERY_BACKOFF_SECONDS: "5"
   COMWECHAT_CHILD_RECOVERY_RESET_SECONDS: "0"
+  COMWECHAT_CHILD_RECOVERY_STABLE_SECONDS: "300"
   COMWECHAT_BRIDGE_ENABLED: "true"
   COMWECHAT_BRIDGE_IN_PORT: "23456"
   COMWECHAT_BRIDGE_API_PORT: "19088"
@@ -83,6 +84,8 @@ Bridge 管理 API 只绑定共享容器网络命名空间内的回环地址，�
 微信或 Hook 子进程意外退出时，镜像优先在当前容器内有限恢复，避免共享网络命名空间被重建。
 连续失败超过上限后停止自动尝试并保留 VNC；默认不会自动重置失败计数，只有显式设置正数
 `COMWECHAT_CHILD_RECOVERY_RESET_SECONDS` 时才会按周期重新计数。
+
+微信栈连续稳定运行达到 `COMWECHAT_CHILD_RECOVERY_STABLE_SECONDS` 后，会清除此前遗留的失败计数。默认值为 300 秒；短时间连续崩溃仍受原恢复上限约束，不会无限重启。
 
 登录界面恢复由独立的 `efb-watchdog` 负责，Bridge 不会点击“确定”或“进入微信”，也不会绕过微信服务端验证。
 
