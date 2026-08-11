@@ -7,6 +7,7 @@ import os
 import socketserver
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -709,6 +710,9 @@ class BridgeApiServer:
                     {
                         "ok": True,
                         "hooks_ready": bool(api_server.state.get("hooks_ready", False)),
+                        "stack_generation": str(
+                            api_server.state.get("stack_generation", "")
+                        ),
                         "queue_size": snapshot["queue_size"],
                         "staged_size": snapshot["staged_size"],
                         "pending_size": snapshot["pending_size"],
@@ -915,7 +919,11 @@ class BridgeService:
     def __init__(self, config: BridgeConfig):
         self.config = config
         self.buffer = MessageBuffer(config)
-        self.state: Dict[str, Any] = {"hooks_ready": False, "is_login": None}
+        self.state: Dict[str, Any] = {
+            "hooks_ready": False,
+            "is_login": None,
+            "stack_generation": uuid.uuid4().hex,
+        }
 
         self.ingress = IngressSocketServer(config, self.buffer)
         self.api = BridgeApiServer(config, self.buffer, self.state)

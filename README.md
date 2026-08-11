@@ -89,6 +89,8 @@ Bridge 管理 API 只绑定共享容器网络命名空间内的回环地址，�
 
 登录界面恢复由独立的 `efb-watchdog` 负责，Bridge 不会点击“确定”或“进入微信”，也不会绕过微信服务端验证。
 
+`/healthz` 返回当前 `stack_generation`。每次微信、Hook 和 Bridge 在容器内重新建立时都会生成新的代次标识，EFB 用它判断旧登录二维码是否仍属于当前微信进程；该标识不包含账号或消息数据。
+
 ## 版本修改开关
 
 `COMWECHAT_VERSION_CHANGE_ENABLED` 默认是 `false`。关闭时，容器启动不会调用版本修改接口；开启为 `true` 后才会执行版本修改。
