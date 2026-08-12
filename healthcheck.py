@@ -23,10 +23,12 @@ def bridge_enabled():
     )
 
 
-def check_url(url):
+def check_url(url, required=None):
     with request.urlopen(url, timeout=3) as response:
         payload = json.loads(response.read().decode("utf-8"))
-    return response.status == 200 and isinstance(payload, dict)
+    if response.status != 200 or not isinstance(payload, dict):
+        return False
+    return all(payload.get(key) is value for key, value in (required or {}).items())
 
 
 def process_state(pid):
@@ -75,7 +77,10 @@ def main():
         return 1
     if bridge_enabled():
         port = os.environ.get("COMWECHAT_BRIDGE_API_PORT", "19088")
-        ok = check_url(f"http://127.0.0.1:{port}/healthz")
+        ok = check_url(
+            f"http://127.0.0.1:{port}/healthz",
+            required={"ok": True, "hooks_ready": True},
+        )
     else:
         port = os.environ.get("COMWECHAT_API_PORT", "18888")
         ok = check_url(f"http://127.0.0.1:{port}/api/?type=0")

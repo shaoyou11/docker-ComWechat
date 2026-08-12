@@ -15,7 +15,10 @@ class HealthcheckTests(unittest.TestCase):
             with mock.patch("healthcheck.core_processes_are_sane", return_value=True), \
                     mock.patch("healthcheck.check_url", return_value=True) as check:
                 self.assertEqual(healthcheck.main(), 0)
-        check.assert_called_once_with("http://127.0.0.1:19088/healthz")
+        check.assert_called_once_with(
+            "http://127.0.0.1:19088/healthz",
+            required={"ok": True, "hooks_ready": True},
+        )
 
     def test_tcp_mode_uses_comwechat_api(self):
         env = {
@@ -27,6 +30,17 @@ class HealthcheckTests(unittest.TestCase):
                     mock.patch("healthcheck.check_url", return_value=True) as check:
                 self.assertEqual(healthcheck.main(), 0)
         check.assert_called_once_with("http://127.0.0.1:18888/api/?type=0")
+
+    def test_bridge_health_requires_ready_payload(self):
+        response = mock.Mock(status=200)
+        response.read.return_value = b'{"ok": true, "hooks_ready": false}'
+        response.__enter__ = mock.Mock(return_value=response)
+        response.__exit__ = mock.Mock(return_value=False)
+        with mock.patch("healthcheck.request.urlopen", return_value=response):
+            self.assertFalse(healthcheck.check_url(
+                "http://127.0.0.1:19088/healthz",
+                required={"ok": True, "hooks_ready": True},
+            ))
 
     def test_rejects_uninterruptible_core_process(self):
         with mock.patch("healthcheck.os.listdir", return_value=["42"]), \
