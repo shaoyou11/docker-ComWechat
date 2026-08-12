@@ -710,6 +710,7 @@ class BridgeApiServer:
                     {
                         "ok": True,
                         "hooks_ready": bool(api_server.state.get("hooks_ready", False)),
+                        "is_login": api_server.state.get("is_login"),
                         "stack_generation": str(
                             api_server.state.get("stack_generation", "")
                         ),
