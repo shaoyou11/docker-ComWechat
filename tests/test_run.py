@@ -18,6 +18,24 @@ class FakeProcess:
 
 
 class DockerWechatHookTests(unittest.TestCase):
+    @mock.patch("run.signal.signal")
+    def test_supervisor_recovery_request_wakes_paused_stack(self, _signal):
+        hook = run.DockerWechatHook()
+        hook.recovery_requested.set()
+
+        self.assertTrue(hook.wait_for_manual_restart())
+        self.assertEqual(hook.supervisor_state, "recovering")
+        self.assertFalse(hook.recovery_requested.is_set())
+
+    @mock.patch("run.signal.signal")
+    def test_supervisor_recovery_request_interrupts_running_stack(self, _signal):
+        hook = run.DockerWechatHook()
+        hook.recovery_requested.set()
+
+        with self.assertRaises(run.WechatStackRecoveryRequested):
+            hook.monitor_children(poll_interval=0)
+        self.assertFalse(hook.recovery_requested.is_set())
+
     @mock.patch("run.CHILD_RECOVERY_RESET_SECONDS", 0)
     def test_recovery_failure_budget_does_not_reset_by_default(self):
         self.assertFalse(run.recovery_failures_should_reset(1000, 1))
@@ -295,6 +313,7 @@ class DockerWechatHookTests(unittest.TestCase):
     ):
         hook = run.DockerWechatHook()
         with mock.patch.object(hook, "prepare"), \
+                mock.patch.object(hook, "start_supervisor_server"), \
                 mock.patch.object(hook, "run_vnc") as run_vnc, \
                 mock.patch.object(hook, "run_wechat") as run_wechat, \
                 mock.patch.object(hook, "run_hook"), \
@@ -324,6 +343,7 @@ class DockerWechatHookTests(unittest.TestCase):
     ):
         hook = run.DockerWechatHook()
         with mock.patch.object(hook, "prepare"), \
+                mock.patch.object(hook, "start_supervisor_server"), \
                 mock.patch.object(hook, "run_vnc"), \
                 mock.patch.object(hook, "run_wechat"), \
                 mock.patch.object(hook, "run_hook"), \
@@ -335,7 +355,9 @@ class DockerWechatHookTests(unittest.TestCase):
                     side_effect=run.ChildProcessStopped("WeChat", 0),
                 ) as monitor, \
                 mock.patch.object(hook, "stop_wechat_stack"), \
-                mock.patch.object(hook, "wait_for_manual_restart") as wait:
+                mock.patch.object(
+                    hook, "wait_for_manual_restart", return_value=False
+                ) as wait:
             hook.run_all_in_one()
 
         self.assertEqual(

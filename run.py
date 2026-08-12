@@ -5,7 +5,9 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from comwechat_bridge import BridgeConfig, BridgeService
 
@@ -34,6 +36,9 @@ WINE_CLEANUP_TIMEOUT_SECONDS = int(
 CHILD_UNRESPONSIVE_SECONDS = int(
     os.environ.get("COMWECHAT_CHILD_UNRESPONSIVE_SECONDS", "30")
 )
+SUPERVISOR_CONTROL_PORT = int(
+    os.environ.get("COMWECHAT_SUPERVISOR_CONTROL_PORT", "19089")
+)
 WINE_PROCESS_NAMES = {
     "WeChat.exe",
     "WeChatHook.exe",
@@ -56,6 +61,10 @@ class ChildProcessStopped(RuntimeError):
 
 
 class WechatStackStartupFailed(RuntimeError):
+    pass
+
+
+class WechatStackRecoveryRequested(RuntimeError):
     pass
 
 
@@ -84,6 +93,9 @@ class DockerWechatHook:
         self.reg_hook = None
         self.bridge = None
         self.exiting = False
+        self.recovery_requested = threading.Event()
+        self.supervisor_state = "starting"
+        self.supervisor_server = None
         signal.signal(signal.SIGINT, self.now_exit)
         signal.signal(signal.SIGHUP, self.now_exit)
         signal.signal(signal.SIGTERM, self.now_exit)
@@ -130,6 +142,55 @@ class DockerWechatHook:
                 "/home/user/.wine/drive_c/Program Files/Tencent/WeChat/WeChat.exe",
             ],
             start_new_session=True,
+        )
+
+    def start_supervisor_server(self):
+        owner = self
+
+        class SupervisorHandler(BaseHTTPRequestHandler):
+            def _send_json(self, status, payload):
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path != "/healthz":
+                    self.send_error(404)
+                    return
+                self._send_json(200, {"ok": True, "state": owner.supervisor_state})
+
+            def do_POST(self):
+                if self.path != "/recover":
+                    self.send_error(404)
+                    return
+                if owner.supervisor_state == "recovering":
+                    self._send_json(
+                        202,
+                        {"ok": True, "accepted": False, "state": "recovering"},
+                    )
+                    return
+                owner.recovery_requested.set()
+                self._send_json(
+                    202,
+                    {"ok": True, "accepted": True, "state": owner.supervisor_state},
+                )
+
+            def log_message(self, _format, *_args):
+                return
+
+        self.supervisor_server = ThreadingHTTPServer(
+            ("127.0.0.1", SUPERVISOR_CONTROL_PORT), SupervisorHandler
+        )
+        threading.Thread(
+            target=self.supervisor_server.serve_forever,
+            daemon=True,
+        ).start()
+        print(
+            f"微信主管控制接口已启动: 127.0.0.1:{SUPERVISOR_CONTROL_PORT}",
+            flush=True,
         )
 
     def run_hook(self):
@@ -232,6 +293,11 @@ class DockerWechatHook:
     def monitor_children(self, poll_interval=1):
         unresponsive_since = {}
         while not self.exiting:
+            if self.recovery_requested.is_set():
+                self.recovery_requested.clear()
+                raise WechatStackRecoveryRequested(
+                    "Watchdog detected a false login or broken message pipeline"
+                )
             for name, process in (
                 ("WeChat", self.wechat),
                 ("Hook", self.reg_hook),
@@ -338,12 +404,18 @@ class DockerWechatHook:
         return True
 
     def wait_for_manual_restart(self):
+        self.supervisor_state = "paused"
         print(
-            "微信栈已停止自动恢复，保留 VNC 与容器等待人工或定时重启。",
+            "微信栈已停止自动恢复，等待 Watchdog 或人工请求一次新的恢复。",
             flush=True,
         )
         while not self.exiting:
-            time.sleep(60)
+            if self.recovery_requested.wait(timeout=60):
+                self.recovery_requested.clear()
+                self.supervisor_state = "recovering"
+                print("收到新的微信栈恢复请求，恢复失败计数已重新启用。", flush=True)
+                return True
+        return False
 
     @staticmethod
     def _terminate(name, process):
@@ -400,6 +472,10 @@ class DockerWechatHook:
             print(f"容器退出时 Wine 会话未完全结束: {error}", flush=True)
         finally:
             self._terminate("VNC", self.vnc)
+            if self.supervisor_server is not None:
+                self.supervisor_server.shutdown()
+                self.supervisor_server.server_close()
+                self.supervisor_server = None
         if exit_code:
             raise SystemExit(exit_code)
 
@@ -411,19 +487,26 @@ class DockerWechatHook:
         )
         try:
             self.prepare()
+            self.start_supervisor_server()
             self.run_vnc()
             recovery_failures = 0
             last_failure = 0.0
             while not self.exiting:
                 stack_ready_at = None
                 try:
+                    self.supervisor_state = "recovering"
                     self.run_wechat()
                     self.run_hook()
                     self.maybe_change_version()
                     self.start_bridge()
                     stack_ready_at = time.monotonic()
+                    self.supervisor_state = "running"
                     self.monitor_children()
-                except (ChildProcessStopped, WechatStackStartupFailed) as error:
+                except (
+                    ChildProcessStopped,
+                    WechatStackStartupFailed,
+                    WechatStackRecoveryRequested,
+                ) as error:
                     now = time.monotonic()
                     if recovery_failures_should_reset(now, last_failure):
                         recovery_failures = 0
@@ -449,7 +532,10 @@ class DockerWechatHook:
                         self.wait_for_manual_restart()
                         return
                     if recovery_failures > CHILD_RECOVERY_ATTEMPTS:
-                        self.wait_for_manual_restart()
+                        if self.wait_for_manual_restart():
+                            recovery_failures = 0
+                            last_failure = 0.0
+                            continue
                         return
                     delay = CHILD_RECOVERY_BACKOFF_SECONDS * recovery_failures
                     print(
