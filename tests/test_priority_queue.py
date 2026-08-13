@@ -20,6 +20,15 @@ class PriorityQueueTests(unittest.TestCase):
         second = {"chat_id": "room-1", "sender": "wxid_b", "chat_type": "group"}
         self.assertEqual(source_chat_key(first), source_chat_key(second))
 
+    def test_chatroom_identifier_marks_real_bridge_shape_as_group(self):
+        incoming = {"sender": "12345@chatroom", "wxid": "wxid_member"}
+        outgoing = {"sender": "wxid_self", "receiver": "12345@chatroom"}
+
+        self.assertEqual(message_priority(incoming), 10)
+        self.assertEqual(message_priority(outgoing), 10)
+        self.assertEqual(source_chat_key(incoming), "12345@chatroom")
+        self.assertEqual(source_chat_key(outgoing), "12345@chatroom")
+
     def test_missing_or_directory_attachment_is_not_stable(self):
         with tempfile.TemporaryDirectory() as directory:
             self.assertFalse(is_stable_regular_file(os.path.join(directory, "missing.bin")))
