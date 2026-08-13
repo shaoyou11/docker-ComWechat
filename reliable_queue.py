@@ -12,10 +12,15 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 ACTIVE_STATES = ("staged", "pending", "inflight")
 MAX_PULL_ITEMS = 500
+GROUP_PRIORITY = 10
 
 
 def _as_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _is_chatroom_identifier(value: Any) -> bool:
+    return _as_text(value).lower().endswith("@chatroom")
 
 
 def message_priority(message: Dict[str, Any]) -> int:
@@ -34,6 +39,15 @@ def message_priority(message: Dict[str, Any]) -> int:
         return 10
     if any(message.get(key) for key in ("roomid", "room_id", "group_id", "chatroom_id")):
         return 10
+    if any(
+        _is_chatroom_identifier(message.get(key))
+        for key in (
+            "chat_id", "chatId", "conversation_id", "conversationId",
+            "sender", "receiver", "from_user", "fromUser", "to_user", "toUser",
+            "wxid", "chat",
+        )
+    ):
+        return GROUP_PRIORITY
     if chat_type in {"private", "contact", "friend", "direct", "私聊", "联系人"}:
         return 0
     if any(message.get(key) for key in ("sender", "from_user", "fromUser", "wxid")):
@@ -43,10 +57,21 @@ def message_priority(message: Dict[str, Any]) -> int:
 
 def source_chat_key(message: Dict[str, Any]) -> str:
     """Build a stable source conversation key for FIFO ordering."""
+    # Incoming and outgoing group messages do not always put the room ID in the
+    # same field. Prefer any explicit chatroom identifier so the whole room
+    # shares one FIFO lane.
+    for key in (
+        "chat_id", "chatId", "conversation_id", "conversationId", "roomid",
+        "room_id", "group_id", "chatroom_id", "sender", "receiver",
+        "from_user", "fromUser", "to_user", "toUser", "wxid", "chat",
+    ):
+        value = _as_text(message.get(key))
+        if _is_chatroom_identifier(value):
+            return value
     for key in (
         "chat_id", "chatId", "conversation_id", "conversationId", "roomid",
         "room_id", "group_id", "chatroom_id", "from_user", "fromUser", "sender",
-        "wxid", "chat",
+        "receiver", "to_user", "toUser", "wxid", "chat",
     ):
         value = _as_text(message.get(key))
         if value:
@@ -396,16 +421,50 @@ class SQLiteMessageQueue:
         now = self._now()
         with self._transaction():
             self._maintenance_locked(now)
-            rows = self._db.execute(
+            highest = self._db.execute(
                 """
-                  SELECT id, dedup_key, payload, attempts
-                    FROM messages
-                   WHERE state='pending' AND available_at <= ?
-                   ORDER BY priority, source_key, source_sequence, sort_at, received_at, id
-                 LIMIT ?
+                SELECT MIN(priority) AS priority
+                  FROM messages
+                 WHERE state='pending' AND available_at <= ?
                 """,
-                (now, min(MAX_PULL_ITEMS, max(1, int(max_items)))),
-            ).fetchall()
+                (now,),
+            ).fetchone()
+            requested = min(MAX_PULL_ITEMS, max(1, int(max_items)))
+            lower_priority_waiting = self._db.execute(
+                """
+                SELECT 1
+                  FROM messages
+                 WHERE state='pending' AND available_at <= ? AND priority > 0
+                 LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+            if (
+                highest is not None
+                and int(highest["priority"] or 0) == 0
+                and lower_priority_waiting is not None
+            ):
+                rows = self._db.execute(
+                    """
+                      SELECT id, dedup_key, payload, attempts
+                        FROM messages
+                       WHERE state='pending' AND available_at <= ? AND priority=0
+                       ORDER BY source_key, source_sequence, sort_at, received_at, id
+                       LIMIT 1
+                    """,
+                    (now,),
+                ).fetchall()
+            else:
+                rows = self._db.execute(
+                    """
+                      SELECT id, dedup_key, payload, attempts
+                        FROM messages
+                       WHERE state='pending' AND available_at <= ?
+                       ORDER BY priority, source_key, source_sequence, sort_at, received_at, id
+                       LIMIT ?
+                    """,
+                    (now, requested),
+                ).fetchall()
 
             messages = []
             deliveries = []

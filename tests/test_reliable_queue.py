@@ -90,6 +90,39 @@ class ReliableQueueTests(unittest.TestCase):
         self.assertEqual(snapshot["deduplicated_total"], 1)
         queue.close()
 
+    def test_contact_claim_is_single_and_preempts_group_batch(self):
+        queue = self.queue()
+        for index in range(5):
+            queue.stage(
+                self.message(f"group-{index}", sender="room@chatroom"),
+                priority=10,
+                source_key="room@chatroom",
+            )
+        queue.stage(self.message("contact"), priority=0, source_key="wxid_contact")
+        queue.release_all_staged()
+
+        first = queue.pull(5, 0, True, "efb")
+        self.assertEqual([item["msgid"] for item in first["messages"]], ["contact"])
+        queue.ack([first["deliveries"][0]["delivery_id"]], "efb")
+
+        second = queue.pull(5, 0, True, "efb")
+        self.assertEqual(len(second["messages"]), 5)
+        self.assertTrue(all(item["sender"] == "room@chatroom" for item in second["messages"]))
+        queue.close()
+
+    def test_non_contact_claim_keeps_existing_ordered_batch_behavior(self):
+        queue = self.queue()
+        queue.stage(self.message("group"), priority=10, source_key="room@chatroom")
+        queue.stage(self.message("unknown"), priority=20, source_key="unknown")
+        queue.release_all_staged()
+
+        first = queue.pull(5, 0, True, "efb")
+        self.assertEqual(
+            [item["msgid"] for item in first["messages"]],
+            ["group", "unknown"],
+        )
+        queue.close()
+
     def test_trace_lists_sanitized_recent_queue_state(self):
         queue = self.queue()
         queue.stage(self.message("private-id"))
