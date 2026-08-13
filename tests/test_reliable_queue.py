@@ -90,6 +90,20 @@ class ReliableQueueTests(unittest.TestCase):
         self.assertEqual(snapshot["deduplicated_total"], 1)
         queue.close()
 
+    def test_trace_lists_sanitized_recent_queue_state(self):
+        queue = self.queue()
+        queue.stage(self.message("private-id"))
+        queue.release_all_staged()
+        result = queue.pull(1, 0, True, "efb")
+        queue.ack([result["deliveries"][0]["delivery_id"]], "efb")
+
+        traces = queue.list_trace(limit=5)
+
+        self.assertEqual(traces[0]["state"], "acked")
+        self.assertNotIn("payload", traces[0])
+        self.assertNotIn("dedup_key", traces[0])
+        self.assertEqual(len(traces[0]["trace_id"]), 12)
+
     def test_expired_lease_is_redelivered_with_new_token(self):
         queue = self.queue(lease_seconds=2)
         queue.stage(self.message())

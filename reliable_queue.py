@@ -341,6 +341,17 @@ class SQLiteMessageQueue:
                 self._condition.notify_all()
             return released
 
+    def replace_payload(self, message_id: str, message: Dict[str, Any]) -> bool:
+        payload = dict(message)
+        payload.pop("_bridge_queue_id", None)
+        payload.pop("_bridge_staged_monotonic", None)
+        with self._condition:
+            cursor = self._db.execute(
+                "UPDATE messages SET payload=? WHERE id=? AND state='staged'",
+                (_canonical_json(payload), str(message_id)),
+            )
+            return cursor.rowcount == 1
+
     def release_all_staged(self) -> int:
         now = self._now()
         released = 0
@@ -426,6 +437,9 @@ class SQLiteMessageQueue:
                             "message_id": row["id"],
                             "delivery_id": delivery_id,
                             "dedup_key": row["dedup_key"],
+                            "trace_id": hashlib.sha256(
+                                row["dedup_key"].encode("utf-8")
+                            ).hexdigest()[:12],
                             "attempts": attempts,
                         }
                     )
@@ -623,6 +637,37 @@ class SQLiteMessageQueue:
                     (min(100, max(1, int(limit))), max(0, int(offset))),
                 ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_trace(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Return recent delivery stages without message content or identifiers."""
+        now = self._now()
+        with self._condition:
+            with self._transaction():
+                self._maintenance_locked(now)
+                rows = self._db.execute(
+                    """
+                    SELECT dedup_key, state, received_at, available_at,
+                           lease_until, attempts, acked_at, dead_at,
+                           discarded_at, last_error
+                      FROM messages
+                     ORDER BY received_at DESC, id DESC
+                     LIMIT ?
+                    """,
+                    (min(100, max(1, int(limit))),),
+                ).fetchall()
+        records = []
+        for row in rows:
+            records.append({
+                "trace_id": hashlib.sha256(row["dedup_key"].encode("utf-8")).hexdigest()[:12],
+                "state": row["state"],
+                "received_at": row["received_at"],
+                "available_at": row["available_at"],
+                "lease_until": row["lease_until"],
+                "attempts": row["attempts"],
+                "finished_at": row["acked_at"] or row["dead_at"] or row["discarded_at"],
+                "error": " ".join(str(row["last_error"] or "").split())[:80],
+            })
+        return records
 
     def list_active(self, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
         now = self._now()

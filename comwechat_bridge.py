@@ -4,6 +4,8 @@ import heapq
 import json
 import logging
 import os
+import hashlib
+import shutil
 import socketserver
 import threading
 import time
@@ -174,6 +176,65 @@ def attachment_ready(msg: Dict[str, Any], attachment_root: str = "") -> bool:
     )
 
 
+def persist_attachment(msg: Dict[str, Any], attachment_root: str,
+                       persistent_root: str, delivery_root: str = "") -> Dict[str, Any]:
+    """Copy a stable attachment to Bridge-owned storage and rewrite its path."""
+    if not requires_attachment(msg) or not persistent_root:
+        return msg
+    source = next(
+        (
+            candidate for candidate in attachment_candidate_paths(
+                attachment_path(msg), attachment_root
+            )
+            if is_stable_regular_file(candidate, settle_seconds=0.01)
+        ),
+        "",
+    )
+    if not source:
+        return msg
+    digest = hashlib.sha256()
+    with open(source, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    suffix = os.path.splitext(source)[1][:16]
+    target = os.path.join(persistent_root, digest.hexdigest() + suffix)
+    os.makedirs(persistent_root, mode=0o700, exist_ok=True)
+    if not os.path.isfile(target):
+        temporary = target + ".tmp-" + uuid.uuid4().hex
+        try:
+            shutil.copyfile(source, temporary)
+            os.replace(temporary, target)
+        finally:
+            try:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            except OSError:
+                pass
+    persisted = dict(msg)
+    for key in ("path", "file_path", "filepath", "filePath", "local_path"):
+        if persisted.get(key):
+            persisted[key] = os.path.join(delivery_root, os.path.basename(target)) if delivery_root else target
+            break
+    return persisted
+
+
+def cleanup_persisted_attachments(root: str, retention_seconds: int,
+                                  now: Optional[float] = None) -> int:
+    """Remove only expired Bridge-owned attachment copies."""
+    if not root or not os.path.isdir(root):
+        return 0
+    cutoff = (time.time() if now is None else float(now)) - max(60, retention_seconds)
+    removed = 0
+    for entry in os.scandir(root):
+        try:
+            if entry.is_file(follow_symlinks=False) and entry.stat().st_mtime < cutoff:
+                os.unlink(entry.path)
+                removed += 1
+        except OSError as exc:
+            LOGGER.warning("Bridge attachment cleanup skipped %s: %s", entry.path, exc)
+    return removed
+
+
 @dataclass
 class BridgeConfig:
     enabled: bool
@@ -192,6 +253,9 @@ class BridgeConfig:
     hook_retry_interval_seconds: float
     metrics_interval_seconds: int
     attachment_root: str = "/home/user/.wine/drive_c/users/user/My Documents/WeChat Files"
+    attachment_persistent_root: str = ""
+    attachment_delivery_root: str = ""
+    attachment_retention_seconds: int = 8 * 24 * 60 * 60
     attachment_wait_timeout_seconds: float = 30.0
     db_path: str = ":memory:"
     lease_seconds: int = 120
@@ -234,6 +298,18 @@ class BridgeConfig:
             attachment_root=os.environ.get(
                 "COMWECHAT_BRIDGE_ATTACHMENT_ROOT",
                 "/home/user/.wine/drive_c/users/user/My Documents/WeChat Files",
+            ),
+            attachment_persistent_root=os.environ.get(
+                "COMWECHAT_BRIDGE_ATTACHMENT_PERSISTENT_ROOT",
+                "",
+            ),
+            attachment_delivery_root=os.environ.get(
+                "COMWECHAT_BRIDGE_ATTACHMENT_DELIVERY_ROOT",
+                "",
+            ),
+            attachment_retention_seconds=max(
+                24 * 60 * 60,
+                _env_int("COMWECHAT_BRIDGE_ATTACHMENT_RETENTION_SECONDS", 8 * 24 * 60 * 60),
             ),
             attachment_wait_timeout_seconds=max(
                 0.0,
@@ -483,6 +559,16 @@ class MessageBuffer:
                 ):
                     deferred.append(candidate)
                     continue
+                if path and attachment_ready(candidate, self.config.attachment_root):
+                    candidate = persist_attachment(
+                        candidate,
+                        self.config.attachment_root,
+                        self.config.attachment_persistent_root,
+                        self.config.attachment_delivery_root,
+                    )
+                    queue_id = candidate.get("_bridge_queue_id")
+                    if queue_id:
+                        self.queue.replace_payload(queue_id, candidate)
                 self._release_locked(candidate)
                 moved += 1
                 self._stats["ready_total"] += 1
@@ -700,6 +786,18 @@ class BridgeApiServer:
                             ),
                         },
                     )
+                    return
+                if parsed.path == "/v1/messages/trace":
+                    try:
+                        query = parse_qs(parsed.query)
+                        limit = int(query.get("limit", ["20"])[0])
+                    except (TypeError, ValueError):
+                        inner_self._send_json(400, {"ok": False, "error": "invalid_arguments"})
+                        return
+                    inner_self._send_json(200, {
+                        "ok": True,
+                        "messages": api_server.buffer.queue.list_trace(limit),
+                    })
                     return
                 if parsed.path != "/healthz":
                     inner_self._send_json(404, {"ok": False, "error": "not_found"})
@@ -1016,7 +1114,17 @@ class BridgeService:
             self.stop_event.wait(interval)
 
     def _metrics_worker(self) -> None:
+        next_attachment_cleanup = 0.0
         while not self.stop_event.wait(self.config.metrics_interval_seconds):
+            now = time.monotonic()
+            if now >= next_attachment_cleanup:
+                removed = cleanup_persisted_attachments(
+                    self.config.attachment_persistent_root,
+                    self.config.attachment_retention_seconds,
+                )
+                if removed:
+                    LOGGER.info("Bridge removed %s expired attachment copies.", removed)
+                next_attachment_cleanup = now + 60 * 60
             snap = self.buffer.snapshot()
             LOGGER.info(
                 "Bridge stats phase=%s probe=%s reorder=%s normal=%s ready=%s ingress=%s ready_total=%s pulled=%s fast=%s anchors=%s probe_timeouts=%s reordered=%s overflow_released=%s hooks_ready=%s is_login=%s",
