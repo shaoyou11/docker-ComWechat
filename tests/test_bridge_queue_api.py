@@ -192,6 +192,16 @@ class BridgeQueueApiTests(unittest.TestCase):
             self.assertEqual(status, 400)
             self.assertEqual(result["error"], "invalid_arguments")
 
+    def test_trace_route_returns_sanitized_records(self):
+        self.buffer.ingest({"id": "trace-route", "message": "secret body"})
+
+        status, payload = self.request_json("/v1/messages/trace?limit=5")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(len(payload["messages"][0]["trace_id"]), 12)
+        self.assertNotIn("payload", payload["messages"][0])
+
 
 if __name__ == "__main__":
     unittest.main()

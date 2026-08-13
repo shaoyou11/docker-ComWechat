@@ -14,6 +14,7 @@ from comwechat_bridge import (
     MessageBuffer,
     is_fast_path,
     is_login_reorder_anchor,
+    cleanup_persisted_attachments,
 )
 
 
@@ -48,6 +49,22 @@ def config(**overrides):
 
 
 class MessageBufferTests(unittest.TestCase):
+    def test_persisted_attachment_cleanup_only_removes_expired_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            expired = os.path.join(directory, "expired.dat")
+            current = os.path.join(directory, "current.dat")
+            with open(expired, "wb") as handle:
+                handle.write(b"old")
+            with open(current, "wb") as handle:
+                handle.write(b"new")
+            os.utime(expired, (100, 100))
+
+            removed = cleanup_persisted_attachments(directory, 200, now=400)
+
+            self.assertEqual(removed, 1)
+            self.assertFalse(os.path.exists(expired))
+            self.assertTrue(os.path.exists(current))
+
     def test_message_classification(self):
         self.assertTrue(is_fast_path({"isSendMsg": 1, "isSendByPhone": 0}))
         self.assertTrue(
@@ -111,6 +128,28 @@ class MessageBufferTests(unittest.TestCase):
             self.assertEqual(
                 buffer.pull(max_items=10, wait_ms=0)["messages"], [message]
             )
+
+    def test_ready_attachment_is_copied_to_bridge_owned_storage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = os.path.join(directory, "account", "FileStorage", "MsgAttach", "image.dat")
+            os.makedirs(os.path.dirname(source))
+            with open(source, "wb") as handle:
+                handle.write(b"stable attachment")
+            persistent_root = os.path.join(directory, ".efb-bridge")
+            buffer = MessageBuffer(config(
+                attachment_root=directory,
+                attachment_persistent_root=persistent_root,
+                attachment_delivery_root="/comwechat/Files/.efb-bridge",
+            ))
+            message = {"id": "persisted", "type": 3, "filepath": source}
+
+            buffer.ingest(message)
+            buffer.emit_ready(limit=10)
+            delivered = buffer.pull(max_items=1, wait_ms=0)["messages"][0]
+
+            self.assertTrue(delivered["filepath"].startswith("/comwechat/Files/.efb-bridge"))
+            persisted = os.path.join(persistent_root, os.path.basename(delivered["filepath"]))
+            self.assertEqual(open(persisted, "rb").read(), b"stable attachment")
 
     def test_overflow_is_bounded(self):
         buffer = MessageBuffer(config(max_buffer=100))
