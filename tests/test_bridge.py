@@ -316,6 +316,7 @@ class BridgeApiTests(unittest.TestCase):
         self.assertIn("deduplicated_total", payload)
         self.assertIn("revision", payload)
         self.assertIn("build_time", payload)
+        self.assertIn("comwechat_version", payload)
 
     def test_bridge_service_assigns_stable_stack_generation(self):
         service = BridgeService(self.config)

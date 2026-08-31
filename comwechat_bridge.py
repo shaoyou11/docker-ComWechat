@@ -827,6 +827,9 @@ class BridgeApiServer:
                         "build_time": os.environ.get(
                             "COMWECHAT_IMAGE_BUILD_TIME", "unknown"
                         ),
+                        "comwechat_version": os.environ.get(
+                            "COMWECHAT_VERSION", "unknown"
+                        ),
                     },
                 )
 
