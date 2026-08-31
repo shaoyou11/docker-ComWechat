@@ -2,6 +2,7 @@ import tempfile
 import threading
 import time
 import unittest
+import sqlite3
 from pathlib import Path
 
 from reliable_queue import ReliableQueueConfig, SQLiteMessageQueue, build_dedup_key
@@ -136,6 +137,38 @@ class ReliableQueueTests(unittest.TestCase):
         self.assertNotIn("payload", traces[0])
         self.assertNotIn("dedup_key", traces[0])
         self.assertEqual(len(traces[0]["trace_id"]), 12)
+        self.assertEqual(
+            list(traces[0]["trace_timestamps"]),
+            ["bridge_enqueued", "attachment_ready", "efb_received", "bridge_acked"],
+        )
+        self.assertNotIn("message", traces[0]["trace_timestamps"])
+
+    def test_existing_queue_schema_is_migrated_without_rebuild(self):
+        database = sqlite3.connect(self.path)
+        database.execute(
+            """
+            CREATE TABLE messages (
+                id TEXT PRIMARY KEY, dedup_key TEXT NOT NULL UNIQUE,
+                payload TEXT NOT NULL, state TEXT NOT NULL,
+                received_at REAL NOT NULL, sort_at REAL NOT NULL,
+                available_at REAL NOT NULL, lease_token TEXT,
+                lease_owner TEXT, lease_until REAL, attempts INTEGER NOT NULL,
+                expires_at REAL NOT NULL, acked_at REAL, dead_at REAL,
+                last_error TEXT
+            )
+            """
+        )
+        database.commit()
+        database.close()
+
+        reopened = self.queue()
+        columns = {
+            row[1] for row in reopened._db.execute("PRAGMA table_info(messages)")
+        }
+
+        self.assertIn("ready_at", columns)
+        self.assertIn("claimed_at", columns)
+        reopened.close()
 
     def test_expired_lease_is_redelivered_with_new_token(self):
         queue = self.queue(lease_seconds=2)

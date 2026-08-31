@@ -156,6 +156,8 @@ class SQLiteMessageQueue:
                     source_key TEXT NOT NULL DEFAULT 'unknown',
                     source_sequence INTEGER NOT NULL DEFAULT 0,
                     available_at REAL NOT NULL,
+                    ready_at REAL,
+                    claimed_at REAL,
                     lease_token TEXT,
                     lease_owner TEXT,
                     lease_until REAL,
@@ -195,6 +197,8 @@ class SQLiteMessageQueue:
                     ("source_sequence", "INTEGER NOT NULL DEFAULT 0"),
                     ("discarded_at", "REAL"),
                     ("discard_reason", "TEXT"),
+                    ("ready_at", "REAL"),
+                    ("claimed_at", "REAL"),
                 )
                 for name, definition in migrations:
                     if name not in columns:
@@ -352,12 +356,14 @@ class SQLiteMessageQueue:
                     cursor = self._db.execute(
                         """
                         UPDATE messages
-                           SET state='pending', available_at=?, sort_at=?
+                           SET state='pending', available_at=?, sort_at=?,
+                               ready_at=COALESCE(ready_at, ?)
                          WHERE state='staged' AND id=?
                         """,
                         (
                             now,
                             self._next_release_sequence_locked(),
+                            now,
                             message_id,
                         ),
                     )
@@ -395,12 +401,14 @@ class SQLiteMessageQueue:
                     cursor = self._db.execute(
                         """
                         UPDATE messages
-                           SET state='pending', available_at=?, sort_at=?
+                           SET state='pending', available_at=?, sort_at=?,
+                               ready_at=COALESCE(ready_at, ?)
                          WHERE state='staged' AND id=?
                         """,
                         (
                             now,
                             self._next_release_sequence_locked(),
+                            now,
                             row["id"],
                         ),
                     )
@@ -480,6 +488,7 @@ class SQLiteMessageQueue:
                                lease_token=?,
                                lease_owner=?,
                                lease_until=?,
+                               claimed_at=COALESCE(claimed_at, ?),
                                attempts=?
                          WHERE id=? AND state='pending'
                         """,
@@ -487,6 +496,7 @@ class SQLiteMessageQueue:
                             delivery_id,
                             consumer_id,
                             now + self.config.lease_seconds,
+                            now,
                             attempts,
                             row["id"],
                         ),
@@ -509,11 +519,12 @@ class SQLiteMessageQueue:
                            SET state='acked',
                                attempts=?,
                                acked_at=?,
+                               claimed_at=COALESCE(claimed_at, ?),
                                lease_owner=?,
                                lease_until=NULL
                          WHERE id=? AND state='pending'
                         """,
-                        (attempts, now, consumer_id, row["id"]),
+                        (attempts, now, now, consumer_id, row["id"]),
                     )
                     self._increment_metric_locked("acked_total")
 
@@ -705,7 +716,8 @@ class SQLiteMessageQueue:
                 self._maintenance_locked(now)
                 rows = self._db.execute(
                     """
-                    SELECT dedup_key, state, received_at, available_at,
+                    SELECT dedup_key, state, received_at, ready_at, claimed_at,
+                           available_at,
                            lease_until, attempts, acked_at, dead_at,
                            discarded_at, last_error
                       FROM messages
@@ -716,6 +728,16 @@ class SQLiteMessageQueue:
                 ).fetchall()
         records = []
         for row in rows:
+            trace_timestamps = {
+                name: float(value)
+                for name, value in (
+                    ("bridge_enqueued", row["received_at"]),
+                    ("attachment_ready", row["ready_at"]),
+                    ("efb_received", row["claimed_at"]),
+                    ("bridge_acked", row["acked_at"]),
+                )
+                if isinstance(value, (int, float)) and float(value) >= 0
+            }
             records.append({
                 "trace_id": hashlib.sha256(row["dedup_key"].encode("utf-8")).hexdigest()[:12],
                 "state": row["state"],
@@ -725,6 +747,7 @@ class SQLiteMessageQueue:
                 "attempts": row["attempts"],
                 "finished_at": row["acked_at"] or row["dead_at"] or row["discarded_at"],
                 "error": " ".join(str(row["last_error"] or "").split())[:80],
+                "trace_timestamps": trace_timestamps,
             })
         return records
 

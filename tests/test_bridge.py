@@ -314,6 +314,8 @@ class BridgeApiTests(unittest.TestCase):
         self.assertEqual(payload["queue_size"], 1)
         self.assertEqual(payload["dead_letter_size"], 0)
         self.assertIn("deduplicated_total", payload)
+        self.assertIn("revision", payload)
+        self.assertIn("build_time", payload)
 
     def test_bridge_service_assigns_stable_stack_generation(self):
         service = BridgeService(self.config)
