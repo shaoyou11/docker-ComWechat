@@ -821,6 +821,15 @@ class BridgeApiServer:
                         "acked_total": snapshot["acked_total"],
                         "deduplicated_total": snapshot["deduplicated_total"],
                         "priority_counts": snapshot.get("priority_counts", {}),
+                        "revision": os.environ.get(
+                            "COMWECHAT_IMAGE_REVISION", "unknown"
+                        ),
+                        "build_time": os.environ.get(
+                            "COMWECHAT_IMAGE_BUILD_TIME", "unknown"
+                        ),
+                        "comwechat_version": os.environ.get(
+                            "COMWECHAT_VERSION", "unknown"
+                        ),
                     },
                 )
 
