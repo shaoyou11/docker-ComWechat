@@ -12,6 +12,7 @@ on:
       - "comwechat_bridge.py"
       - "reliable_queue.py"
       - "healthcheck.py"
+      - "dbus_runtime.py"
       - "tests/**"
   push:
     branches:
@@ -24,6 +25,7 @@ on:
       - "comwechat_bridge.py"
       - "reliable_queue.py"
       - "healthcheck.py"
+      - "dbus_runtime.py"
       - "tests/**"
   workflow_dispatch:
 
@@ -44,7 +46,7 @@ jobs:
           python-version: "3.9"
       - name: Compile and test
         run: |
-          python -m py_compile run.py comwechat_bridge.py reliable_queue.py healthcheck.py
+          python -m py_compile run.py comwechat_bridge.py reliable_queue.py healthcheck.py dbus_runtime.py
           python -m unittest discover -s tests -v
 
   publish:
@@ -105,9 +107,20 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: false
+          load: true
           build-args: |
             COMWECHAT_IMAGE_REVISION=${{ github.event.pull_request.head.sha }}
             COMWECHAT_IMAGE_BUILD_TIME=${{ steps.metadata.outputs.build_time }}
           tags: ghcr.io/shaoyou11/docker-comwechat:canary
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Verify private D-Bus startup without WeChat or production data
+        run: |
+          docker run --rm --network none --entrypoint sh \
+            ghcr.io/shaoyou11/docker-comwechat:canary -ec '
+              python3 /dbus_runtime.py
+              dbus-send --system --print-reply --reply-timeout=2000 --dest=org.freedesktop.DBus / org.freedesktop.DBus.ListNames
+              dbus-send --session --print-reply --reply-timeout=2000 --dest=org.freedesktop.DBus / org.freedesktop.DBus.ListNames
+              python3 /dbus_runtime.py
+              test "$(ps -C dbus-daemon --no-headers | wc -l)" -eq 2
+            '

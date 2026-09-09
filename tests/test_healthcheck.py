@@ -6,6 +6,17 @@ import healthcheck
 
 
 class HealthcheckTests(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch("healthcheck.bus_ready", return_value=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_missing_bus_rejects_otherwise_healthy_stack(self):
+        with mock.patch("healthcheck.bus_ready", side_effect=[True, False]), \
+                mock.patch("healthcheck.check_url") as check:
+            self.assertEqual(healthcheck.main(), 1)
+        check.assert_not_called()
+
     def test_bridge_mode_uses_bridge_api(self):
         env = {
             "COMWECHAT_BRIDGE_ENABLED": "true",

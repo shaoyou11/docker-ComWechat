@@ -37,10 +37,14 @@ ENV COMWECHAT_VERSION=3.9.12.16 \
     COMWECHAT_HOOK_RETRY_INTERVAL_SECONDS=2 \
     COMWECHAT_CONSUME_RATE_PER_SEC=5
 
-COPY run.py comwechat_bridge.py reliable_queue.py healthcheck.py /
+ENV DBUS_SYSTEM_BUS_ADDRESS=unix:path=/run/dbus/system_bus_socket \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/comwechat/session_bus_socket
+
+COPY run.py comwechat_bridge.py reliable_queue.py healthcheck.py dbus_runtime.py /
 
 RUN mkdir -p /var/lib/comwechat-bridge && \
-    python3 -m py_compile /run.py /comwechat_bridge.py /reliable_queue.py /healthcheck.py && \
+    command -v dbus-daemon && command -v dbus-send && \
+    python3 -m py_compile /run.py /comwechat_bridge.py /reliable_queue.py /healthcheck.py /dbus_runtime.py && \
     chmod 0755 /run.py /healthcheck.py
 
 EXPOSE 5905
