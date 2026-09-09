@@ -4,6 +4,8 @@ import os
 import sys
 from urllib import request
 
+from dbus_runtime import BUSES, bus_ready
+
 
 CORE_PROCESS_LIMITS = {
     "WeChat.exe": 1,
@@ -73,6 +75,9 @@ def core_processes_are_sane():
 
 
 def main():
+    if not all(bus_ready(kind) for kind in BUSES):
+        print("healthcheck failed: D-Bus unavailable", file=sys.stderr)
+        return 1
     if not core_processes_are_sane():
         return 1
     if bridge_enabled():

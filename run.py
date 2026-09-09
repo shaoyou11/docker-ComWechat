@@ -551,5 +551,8 @@ class DockerWechatHook:
 
 
 if __name__ == "__main__":
+    from dbus_runtime import ensure_dbus
+
+    ensure_dbus()
     print("---All in one 微信 ComRobot 容器---", flush=True)
     DockerWechatHook().run_all_in_one()
