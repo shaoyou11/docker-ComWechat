@@ -21,6 +21,8 @@ class DockerWechatHookTests(unittest.TestCase):
     @mock.patch("run.signal.signal")
     def test_supervisor_recovery_request_wakes_paused_stack(self, _signal):
         hook = run.DockerWechatHook()
+        hook.pending_recovery = {"source": "manual"}
+        hook.manual_scan_active = mock.Mock(return_value=False)
         hook.recovery_requested.set()
 
         self.assertTrue(hook.wait_for_manual_restart())
@@ -30,6 +32,8 @@ class DockerWechatHookTests(unittest.TestCase):
     @mock.patch("run.signal.signal")
     def test_supervisor_recovery_request_interrupts_running_stack(self, _signal):
         hook = run.DockerWechatHook()
+        hook.pending_recovery = {"source": "manual"}
+        hook.manual_scan_active = mock.Mock(return_value=False)
         hook.recovery_requested.set()
 
         with self.assertRaises(run.WechatStackRecoveryRequested):
@@ -365,6 +369,65 @@ class DockerWechatHookTests(unittest.TestCase):
             run.CHILD_RECOVERY_ATTEMPTS + 1,
         )
         wait.assert_called_once_with()
+
+
+class BoundedRecoveryTests(unittest.TestCase):
+    @mock.patch("run.signal.signal")
+    def test_request_runs_one_replacement_without_child_retries(self, _signal):
+        hook = run.DockerWechatHook()
+        def first():
+            hook.single_recovery_launch = True
+            raise run.WechatStackRecoveryRequested("requested")
+        events = iter([first, lambda: (_ for _ in ()).throw(run.ChildProcessStopped("WeChat", 52))])
+        with mock.patch.object(hook, "prepare"), mock.patch.object(hook, "start_supervisor_server"), mock.patch.object(hook, "run_vnc"), mock.patch.object(hook, "run_wechat") as launch, mock.patch.object(hook, "run_hook"), mock.patch.object(hook, "maybe_change_version"), mock.patch.object(hook, "start_bridge"), mock.patch.object(hook, "monitor_children", side_effect=lambda: next(events)()), mock.patch.object(hook, "stop_wechat_stack"), mock.patch.object(hook, "wait_for_manual_restart", return_value=False) as pause, mock.patch("run.time.sleep"):
+            hook.run_all_in_one()
+        self.assertEqual(launch.call_count, 2)  # Original plus exactly one replacement.
+        pause.assert_called_once()
+
+    @mock.patch("run.signal.signal")
+    def test_recovery_contract_rejects_legacy_online_paused_auto_and_scan(self, _signal):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as d, mock.patch.dict(run.os.environ, {"COMWECHAT_RECOVERY_LEDGER_PATH": d + "/ledger"}):
+            hook = run.DockerWechatHook()
+            hook.manual_scan_active = mock.Mock(return_value=False)
+            hook.bridge = mock.Mock(state={"is_login": False, "hooks_ready": True, "stack_generation": "one"})
+            hook.supervisor_state = "running"
+            request = {"source": "automatic", "request_id": "episode", "stack_generation": "one"}
+            self.assertEqual(hook.accept_recovery({})[0], 400)
+            hook.bridge.state["is_login"] = True
+            self.assertEqual(hook.accept_recovery(request)[0], 409)
+            hook.bridge.state["is_login"] = False
+            hook.supervisor_state = "paused"
+            self.assertEqual(hook.accept_recovery(request)[0], 409)
+            hook.supervisor_state = "running"
+            hook.manual_scan_active.return_value = True
+            self.assertEqual(hook.accept_recovery(request)[0], 409)
+            hook.manual_scan_active.return_value = False
+            self.assertEqual(hook.accept_recovery(request)[0], 202)
+            hook.manual_scan_active.return_value = True
+            self.assertFalse(hook.consume_recovery())
+            self.assertEqual(hook.supervisor_state, "running")
+            hook.manual_scan_active.return_value = False
+            status, response = hook.accept_recovery(request)
+            self.assertEqual(status, 200)
+            self.assertFalse(response["accepted"])
+            hook.supervisor_state = "paused"
+            self.assertEqual(hook.accept_recovery({"source": "manual", "request_id": "user-click"})[0], 202)
+            self.assertTrue(hook.consume_recovery())
+            self.assertTrue(hook.single_recovery_launch)
+
+    @mock.patch("run.signal.signal")
+    def test_shared_scan_state_fails_closed_and_reads_without_deleting(self, _signal):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as d, mock.patch.dict(run.os.environ, {"COMWECHAT_MANUAL_LOGIN_SESSION_PATH": d + "/lease"}):
+            hook = run.DockerWechatHook()
+            self.assertFalse(hook.manual_scan_active())
+            path = run.Path(d) / "lease"
+            path.write_text("bad json")
+            self.assertTrue(hook.manual_scan_active())
+            path.write_text('{"expires_at": 0}')
+            self.assertFalse(hook.manual_scan_active())
+            self.assertTrue(path.exists())
 
 
 if __name__ == "__main__":

@@ -243,6 +243,10 @@ class BridgeApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["messages"], [message])
         self.assertEqual(payload["deliveries"], [])
+        # Legacy acknowledgment happens after the HTTP response is written.
+        deadline = time.monotonic() + 2
+        while self.buffer.snapshot()["acked_size"] != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
         self.assertEqual(self.buffer.snapshot()["acked_size"], 1)
 
     def test_pull_endpoint_caps_batch_size(self):
