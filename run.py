@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from comwechat_bridge import BridgeConfig, BridgeService
@@ -96,6 +97,11 @@ class DockerWechatHook:
         self.recovery_requested = threading.Event()
         self.supervisor_state = "starting"
         self.supervisor_server = None
+        self.recovery_lock = threading.Lock()
+        self.pending_recovery = None
+        self.single_recovery_launch = False
+        self.last_recovery_error = ""
+        self.confirmed_online_since = None
         signal.signal(signal.SIGINT, self.now_exit)
         signal.signal(signal.SIGHUP, self.now_exit)
         signal.signal(signal.SIGTERM, self.now_exit)
@@ -144,6 +150,87 @@ class DockerWechatHook:
             start_new_session=True,
         )
 
+    def manual_scan_active(self):
+        path = Path(os.environ.get("COMWECHAT_MANUAL_LOGIN_SESSION_PATH",
+                                   "/var/lib/wechat-session/manual-login-session.json"))
+        if not path.parent.is_dir():
+            return True  # No shared protection state: fail closed.
+        try:
+            return float(json.loads(path.read_text())["expires_at"]) > time.time()
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError, TypeError, KeyError):
+            return True
+
+    def recovery_status(self):
+        return {"ok": True, "state": self.supervisor_state,
+                "recovery_protocol": 1, "last_error": self.last_recovery_error,
+                "request_pending": self.pending_recovery is not None,
+                "manual_retry_required": self.supervisor_state == "paused"}
+
+    def accept_recovery(self, payload):
+        source = payload.get("source")
+        key = str(payload.get("request_id", ""))
+        if source not in ("manual", "automatic") or not key or len(key) > 160:
+            return 400, {"ok": False, "reason": "explicit_bounded_request_required"}
+        with self.recovery_lock:
+            if self.pending_recovery is not None or self.supervisor_state == "recovering":
+                return 409, {"ok": False, "reason": "recovery_in_progress"}
+            if source == "automatic" and self.manual_scan_active():
+                return 409, {"ok": False, "reason": "manual_scan_active"}
+            state = self.bridge.state if self.bridge is not None else {}
+            if source == "manual":
+                if self.supervisor_state != "paused":
+                    return 409, {"ok": False, "reason": "manual_retry_only_when_paused"}
+                if self._wine_processes():
+                    return 409, {"ok": False, "reason": "previous_process_cleanup_incomplete"}
+            elif (self.supervisor_state != "running" or state.get("is_login") is not False
+                  or state.get("hooks_ready") is not True
+                  or not payload.get("stack_generation")
+                  or state.get("stack_generation") != payload.get("stack_generation")):
+                return 409, {"ok": False, "reason": "offline_generation_not_confirmed"}
+            ledger = Path(os.environ.get("COMWECHAT_RECOVERY_LEDGER_PATH",
+                                         "/var/lib/comwechat-bridge/recovery-requests.json"))
+            try:
+                ids = json.loads(ledger.read_text()) if ledger.exists() else []
+                if not isinstance(ids, list):
+                    raise ValueError("invalid ledger")
+                if key in ids:
+                    return 200, {"ok": True, "accepted": False, "reason": "duplicate_request"}
+                ledger.parent.mkdir(parents=True, exist_ok=True)
+                temporary = ledger.with_suffix(".tmp")
+                with temporary.open("w") as handle:
+                    json.dump((ids + [key])[-100:], handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                temporary.replace(ledger)
+            except (OSError, ValueError):
+                return 503, {"ok": False, "reason": "recovery_record_unavailable"}
+            self.pending_recovery = dict(payload)
+            self.recovery_requested.set()
+            return 202, {"ok": True, "accepted": True, "recovery_protocol": 1}
+
+    def consume_recovery(self):
+        with self.recovery_lock:
+            payload = self.pending_recovery
+            self.pending_recovery = None
+            self.recovery_requested.clear()
+            if not payload:
+                return False
+            previous = self.supervisor_state
+            self.supervisor_state = "recovering"  # Block new QR generation first.
+            state = self.bridge.state if self.bridge is not None else {}
+            if payload["source"] == "automatic" and (self.manual_scan_active() or (
+                state.get("is_login") is not False or
+                state.get("stack_generation") != payload.get("stack_generation")
+            )):
+                self.supervisor_state = previous
+                return False
+            self.single_recovery_launch = True
+            self.confirmed_online_since = None
+            self.last_recovery_error = ""
+            return True
+
     def start_supervisor_server(self):
         owner = self
 
@@ -160,23 +247,24 @@ class DockerWechatHook:
                 if self.path != "/healthz":
                     self.send_error(404)
                     return
-                self._send_json(200, {"ok": True, "state": owner.supervisor_state})
+                self._send_json(200, owner.recovery_status())
 
             def do_POST(self):
                 if self.path != "/recover":
                     self.send_error(404)
                     return
-                if owner.supervisor_state == "recovering":
-                    self._send_json(
-                        202,
-                        {"ok": True, "accepted": False, "state": "recovering"},
-                    )
+                try:
+                    size = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < size <= 2048:
+                        raise ValueError("invalid size")
+                    payload = json.loads(self.rfile.read(size))
+                    if not isinstance(payload, dict):
+                        raise ValueError("invalid payload")
+                except (ValueError, TypeError):
+                    self._send_json(400, {"ok": False, "reason": "explicit_bounded_request_required"})
                     return
-                owner.recovery_requested.set()
-                self._send_json(
-                    202,
-                    {"ok": True, "accepted": True, "state": owner.supervisor_state},
-                )
+                status, response = owner.accept_recovery(payload)
+                self._send_json(status, response)
 
             def log_message(self, _format, *_args):
                 return
@@ -293,11 +381,16 @@ class DockerWechatHook:
     def monitor_children(self, poll_interval=1):
         unresponsive_since = {}
         while not self.exiting:
-            if self.recovery_requested.is_set():
-                self.recovery_requested.clear()
-                raise WechatStackRecoveryRequested(
-                    "Watchdog detected a false login or broken message pipeline"
-                )
+            if self.recovery_requested.is_set() and self.consume_recovery():
+                raise WechatStackRecoveryRequested("Explicit single-attempt recovery")
+            state = self.bridge.state if self.bridge is not None else {}
+            if state.get("is_login") is True and state.get("hooks_ready") is True:
+                if self.confirmed_online_since is None:
+                    self.confirmed_online_since = time.monotonic()
+                if time.monotonic() - self.confirmed_online_since >= 30:
+                    self.single_recovery_launch = False
+            else:
+                self.confirmed_online_since = None
             for name, process in (
                 ("WeChat", self.wechat),
                 ("Hook", self.reg_hook),
@@ -406,14 +499,12 @@ class DockerWechatHook:
     def wait_for_manual_restart(self):
         self.supervisor_state = "paused"
         print(
-            "微信栈已停止自动恢复，等待 Watchdog 或人工请求一次新的恢复。",
+            "微信栈已停止自动恢复，等待用户主动请求一次新的恢复。",
             flush=True,
         )
         while not self.exiting:
-            if self.recovery_requested.wait(timeout=60):
-                self.recovery_requested.clear()
-                self.supervisor_state = "recovering"
-                print("收到新的微信栈恢复请求，恢复失败计数已重新启用。", flush=True)
+            if self.recovery_requested.wait(timeout=60) and self.consume_recovery():
+                print("收到用户请求，仅尝试启动一次微信。", flush=True)
                 return True
         return False
 
@@ -522,7 +613,10 @@ class DockerWechatHook:
                                 "微信栈已稳定运行，旧的恢复失败计数已清零。",
                                 flush=True,
                             )
-                    recovery_failures += 1
+                    requested = isinstance(error, WechatStackRecoveryRequested)
+                    stop_after_failure = self.single_recovery_launch and not requested
+                    self.last_recovery_error = str(error)[:240]
+                    recovery_failures = 0 if requested else recovery_failures + 1
                     last_failure = now
                     print(f"微信栈需要恢复: {error}", flush=True)
                     try:
@@ -531,7 +625,7 @@ class DockerWechatHook:
                         print(f"微信栈恢复已停止: {cleanup_error}", flush=True)
                         self.wait_for_manual_restart()
                         return
-                    if recovery_failures > CHILD_RECOVERY_ATTEMPTS:
+                    if stop_after_failure or recovery_failures > CHILD_RECOVERY_ATTEMPTS:
                         if self.wait_for_manual_restart():
                             recovery_failures = 0
                             last_failure = 0.0
